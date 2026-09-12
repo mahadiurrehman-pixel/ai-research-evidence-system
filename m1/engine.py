@@ -284,11 +284,20 @@ class InvestigationEngine:
             state.log("followup_needed", f"focus={m3_result.research_focus}")
 
         # ── FINALIZE ──────────────────────────
+        # ★ FIX: If loop ends and M3 didn't generate a verdict yet,
+        # force M3 to run the Judge to produce an INCONCLUSIVE verdict object!
         verdict = m3_result.verdict if m3_result else None
+
+        if verdict is None and m3_state is not None:
+            try:
+                forced_res = self._m3._finalize(m3_state, force_judge=True)
+                verdict = forced_res.verdict
+            except Exception as e:
+                logger.warning("Forced M3 finalize failed: %s", e)
+
         return self._finalize(state, start_time, verdict=verdict, route_meta=route_meta)
 
     # ── Helpers (CONCURRENT!) ─────────────────
-
     def _execute_search_round(
         self,
         queries: list[SearchQuery],
@@ -296,7 +305,7 @@ class InvestigationEngine:
         state: InvestigationState,
         seen_source_ids: set[str],
     ) -> list:
-        """Parallelize all M2 queries to execute concurrently, saving ~2.0s."""
+        """Parallelize all M2 queries to execute concurrently with MAX speed."""
         results: list = []
         lock = threading.Lock()
 
@@ -320,6 +329,10 @@ class InvestigationEngine:
                             if sid not in seen_source_ids:
                                 seen_source_ids.add(sid)
                                 results.append(ev)
+                    state.log(
+                        "m2_query_ok",
+                        f"query='{query.query[:40]}' got={len(validated)}",
+                    )
                     break  # success
                 except Exception as e:
                     attempts += 1
@@ -328,8 +341,9 @@ class InvestigationEngine:
                         break
                     time.sleep(CONFIG.M2_RETRY_DELAY)
 
-        # ★ Run up to 5 parallel M2 queries
-        with ThreadPoolExecutor(max_workers=min(5, len(queries))) as executor:
+        # ★ SPEED FIX: Increased max_workers from 5 to len(queries) (usually 7-8)
+        # Yeh saari searches ko EXACTLY ek sath chalayega, saving ~1-2 seconds!
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
             executor.map(_search_single, queries)
 
         return results

@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+@layer base {
+  * {
+    @apply border-ink-700/30;
+  }
+
+  body {
+    @apply bg-ink-950 text-surface-200 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  ::selection {
+    @apply bg-accent/20 text-accent-light;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-ink-600 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-ink-500;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-ink-900/80 backdrop-blur-xl border border-ink-700/20;
+  }
+
+  .glass-surface {
+    @apply bg-ink-850/60 backdrop-blur-md border border-ink-700/15;
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-surface-100 to-surface-300 bg-clip-text text-transparent;
+  }
+
+  .accent-gradient {
+    @apply bg-gradient-to-r from-accent to-accent-light bg-clip-text text-transparent;
+  }
+
+  .border-subtle {
+    @apply border-ink-700/20;
+  }
+
+  .focus-ring {
+    @apply focus:outline-none focus:ring-1 focus:ring-accent/40 focus:ring-offset-1 focus:ring-offset-ink-950;
+  }
+}

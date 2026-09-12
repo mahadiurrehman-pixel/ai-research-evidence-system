@@ -74,3 +74,19 @@ storage/
 research_history.db
 vector_db/
 chroma_db/
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+node_modules/
+.next/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

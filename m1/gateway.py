@@ -1,11 +1,10 @@
 """
-m1/gateway.py — Shared LLM Gateway with provider-specific schema normalization.
+m1/gateway.py — Shared LLM Gateway with task-aware model routing and 4 Groq Keys.
 
-Features:
-- Groq / OpenRouter: Strict JSON Schema with additionalProperties: False
-- Gemini: Inlined, dereferenced schema without $defs or additionalProperties
-- HuggingFace: Standard unconstrained JSON Schema
-- Fast failover on 400 schema error, 401/402/403, 404 model unavailable, 429, timeout
+FIXES:
+- Prevents 429 rate limits from being misclassified as permanent errors due to
+  billing URLs in the error body.
+- Rate limits now apply a short 10-15s soft cooldown, NEVER 3600s.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from verification.scheduler import (
     is_rate_limit_error,
     is_timeout_error,
     is_connection_error,
-    is_permanent_error,
     _extract_retry_after,
 )
 
@@ -56,6 +54,8 @@ T = TypeVar("T", bound=BaseModel)
 # Error Classification
 # ============================================================
 
+# Strictly permanent auth/billing tokens (excluding generic substrings like "billing"
+# which appear in Groq 429 response URLs).
 _PERMANENT_TOKENS = (
     "invalid api key",
     "invalid_api_key",
@@ -64,22 +64,12 @@ _PERMANENT_TOKENS = (
     "402",
     "payment required",
     "payment_required",
-    "forbidden",
     "403",
-    "invalid_request",
-    "billing",
+    "invalid_request_error",
     "insufficient_quota",
     "insufficient credits",
     "permission denied",
-    "authentication",
-    "api key",
-    "additionalproperties",
-    "additional_properties",
-    "unknown name",
-    "unsupported parameter",
-    "unsupported_parameter",
-    "invalid parameter",
-    "extra inputs are not permitted",
+    "account deactivated",
 )
 
 _MODEL_UNAVAILABLE_TOKENS = (
@@ -100,9 +90,15 @@ def _error_message(error: Exception) -> str:
 
 
 def _classify(error: Exception) -> LLMProviderError:
-    """Convert arbitrary exceptions into project-level errors."""
+    """
+    Convert arbitrary exceptions into project-level errors.
+    Rate limits (429) are ALWAYS transient.
+    """
     if isinstance(error, LLMProviderError):
         return error
+
+    if is_rate_limit_error(error):
+        return LLMTransientError(str(error))
 
     if type(error).__name__ in ("PermanentLLMError", "LLMPermanentError"):
         return LLMPermanentError(str(error))
@@ -110,7 +106,7 @@ def _classify(error: Exception) -> LLMProviderError:
     message = _error_message(error)
     status_code = getattr(error, "status_code", None)
 
-    if status_code in (400, 401, 402, 403, 404):
+    if status_code in (401, 402, 403, 404):
         return LLMPermanentError(str(error))
 
     if any(token in message for token in _PERMANENT_TOKENS):
@@ -146,14 +142,14 @@ def _is_unsupported_parameter(error: Exception) -> bool:
 
 def _get_timeout_for_task(task_type: str) -> float:
     if task_type in ("query_generation", "decomposition", "search_planning", "classification"):
-        return getattr(CONFIG, "TIMEOUT_QUERY_GENERATION", 30.0)
+        return getattr(CONFIG, "TIMEOUT_QUERY_GENERATION", 15.0)
     if task_type in ("evidence_analysis", "evidence_extraction"):
-        return getattr(CONFIG, "TIMEOUT_EVIDENCE_ANALYSIS", 45.0)
+        return getattr(CONFIG, "TIMEOUT_EVIDENCE_ANALYSIS", 25.0)
     if task_type in ("contradiction_detection", "contradiction_pairs"):
-        return getattr(CONFIG, "TIMEOUT_CONTRADICTION_PAIRS", 45.0)
+        return getattr(CONFIG, "TIMEOUT_CONTRADICTION_PAIRS", 20.0)
     if task_type in ("final_verdict", "final_synthesis"):
-        return getattr(CONFIG, "TIMEOUT_FINAL_VERDICT", 90.0)
-    return getattr(CONFIG, "LLM_TIMEOUT", 30.0)
+        return getattr(CONFIG, "TIMEOUT_FINAL_VERDICT", 25.0)
+    return getattr(CONFIG, "LLM_TIMEOUT", 25.0)
 
 
 # ============================================================
@@ -253,6 +249,7 @@ class _OpenAICompatibleProvider(_Provider):
         except Exception as error:
             raise LLMTransientError(f"Invalid completion response: {error}") from error
         return (content or "").strip()
+
     def structured(
         self,
         system: str,
@@ -260,12 +257,7 @@ class _OpenAICompatibleProvider(_Provider):
         model: Type[T],
         timeout: Optional[float] = None,
     ) -> T:
-        t = (
-            timeout
-            if timeout is not None
-            else self._default_timeout
-        )
-
+        t = timeout if timeout is not None else self._default_timeout
         provider_schema = self._schema_builder(model)
 
         schema_hint = (
@@ -277,9 +269,7 @@ class _OpenAICompatibleProvider(_Provider):
             {"role": "user", "content": user},
         ]
 
-        # ----------------------------------------------------
-        # Attempt 1: Strict JSON Schema
-        # ----------------------------------------------------
+        # Attempt 1: JSON Schema mode
         try:
             completion = self._create_completion(
                 messages=messages,
@@ -297,9 +287,7 @@ class _OpenAICompatibleProvider(_Provider):
             if content:
                 return model.model_validate_json(content)
         except Exception as error:
-            logger.debug("[%s] Strict JSON schema failed (%s) → trying json_object mode", self.name, error)
-            # ★ FIX: If it's a rate limit, timeout, or connection error, raise to failover.
-            # But if it's a schema/400 issue, DON'T raise — try Attempt 2 (json_object) on same provider!
+            logger.debug("[%s] JSON schema mode failed (%s) -> trying json_object", self.name, error)
             if (
                 _is_model_unavailable(error)
                 or is_connection_error(error)
@@ -308,9 +296,7 @@ class _OpenAICompatibleProvider(_Provider):
             ):
                 raise
 
-        # ----------------------------------------------------
-        # Attempt 2: JSON Object Mode (Groq supports this 100%)
-        # ----------------------------------------------------
+        # Attempt 2: JSON Object mode
         try:
             completion = self._create_completion(
                 messages=messages,
@@ -330,9 +316,7 @@ class _OpenAICompatibleProvider(_Provider):
             ):
                 raise
 
-        # ----------------------------------------------------
-        # Attempt 3: Plain completion with JSON prompt
-        # ----------------------------------------------------
+        # Attempt 3: Plain completion
         completion = self._create_completion(
             messages=messages,
             timeout=t,
@@ -372,7 +356,7 @@ class _OpenAICompatibleProvider(_Provider):
 
 
 # ============================================================
-# Groq
+# Groq Provider
 # ============================================================
 
 class _GroqProvider(_OpenAICompatibleProvider):
@@ -383,12 +367,12 @@ class _GroqProvider(_OpenAICompatibleProvider):
             model=model,
             label=label,
             timeout=timeout,
-            schema_builder=build_groq_schema,  # ★ Strict additionalProperties: False
+            schema_builder=build_groq_schema,
         )
 
 
 # ============================================================
-# OpenRouter
+# OpenRouter Provider
 # ============================================================
 
 class _OpenRouterProvider(_OpenAICompatibleProvider):
@@ -402,8 +386,7 @@ class _OpenRouterProvider(_OpenAICompatibleProvider):
     ):
         if not model.endswith(":free"):
             logger.warning(
-                "OpenRouter model '%s' does not end with ':free'. "
-                "Set OPENROUTER_MODEL to a free variant to avoid billing.",
+                "OpenRouter model '%s' does not end with ':free'.",
                 model,
             )
 
@@ -420,28 +403,29 @@ class _OpenRouterProvider(_OpenAICompatibleProvider):
             label="openrouter",
             timeout=timeout,
             default_headers=headers or None,
-            schema_builder=build_openrouter_schema,  # ★ Strict additionalProperties: False
+            schema_builder=build_openrouter_schema,
         )
 
 
 # ============================================================
-# Gemini (google-genai SDK)
+# Gemini Provider
 # ============================================================
 
 class _GeminiProvider(_Provider):
-    """
-    Google Gemini provider using google-genai SDK.
-    Uses build_gemini_schema to remove $defs, $schema, and additionalProperties.
-    """
-
     def __init__(self, api_key: str, model_name: str, timeout: float):
-        from google import genai
+        try:
+            from google import genai
+            self._client = genai.Client(api_key=api_key)
+            self._use_new_sdk = True
+        except ImportError:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            self._model_obj = genai.GenerativeModel(model_name=model_name)
+            self._use_new_sdk = False
 
         self.name = f"gemini({model_name})"
         self.model = model_name
         self._default_timeout = timeout
-
-        self._client = genai.Client(api_key=api_key)
 
     def structured(
         self,
@@ -450,20 +434,32 @@ class _GeminiProvider(_Provider):
         model: Type[T],
         timeout: Optional[float] = None,
     ) -> T:
-        from google.genai import types
+        schema = build_gemini_schema(model)
+        prompt = f"{system}\n\nUSER:\n{user}"
 
-        # ★ Provider-specific Gemini schema: cleaned, inlined, no $defs or additionalProperties
-        gemini_schema = build_gemini_schema(model)
-
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=f"{system}\n\nUSER:\n{user}",
-            config=types.GenerateContentConfig(
-                temperature=CONFIG.LLM_TEMPERATURE,
-                response_mime_type="application/json",
-                response_schema=gemini_schema,
-            ),
-        )
+        if self._use_new_sdk:
+            from google.genai import types
+            response = self._client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=CONFIG.LLM_TEMPERATURE,
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
+            )
+        else:
+            schema_hint = (
+                "\n\nRespond with ONLY valid JSON matching this schema:\n"
+                f"{json.dumps(schema, indent=2)}"
+            )
+            response = self._model_obj.generate_content(
+                f"{system}\n{schema_hint}\n\nUSER:\n{user}",
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": CONFIG.LLM_TEMPERATURE,
+                },
+            )
 
         content = (getattr(response, "text", "") or "").strip()
         if not content:
@@ -483,10 +479,14 @@ class _GeminiProvider(_Provider):
         user: str,
         timeout: Optional[float] = None,
     ) -> str:
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=f"{system}\n\nUSER:\n{user}",
-        )
+        prompt = f"{system}\n\nUSER:\n{user}"
+        if self._use_new_sdk:
+            response = self._client.models.generate_content(
+                model=self.model, contents=prompt,
+            )
+        else:
+            response = self._model_obj.generate_content(prompt)
+
         content = (getattr(response, "text", "") or "").strip()
         if not content:
             raise LLMTransientError(f"{self.name}: empty text response")
@@ -494,7 +494,7 @@ class _GeminiProvider(_Provider):
 
 
 # ============================================================
-# HuggingFace Router
+# HuggingFace Provider
 # ============================================================
 
 class _HuggingFaceProvider(_Provider):
@@ -544,7 +544,7 @@ class _HuggingFaceProvider(_Provider):
     def _try_switch(self) -> bool:
         if self._switched or not self._fallback:
             return False
-        logger.warning("HF model '%s' unavailable → switching to '%s'", self._current, self._fallback)
+        logger.warning("HF model '%s' unavailable -> switching to '%s'", self._current, self._fallback)
         self._current = self._fallback
         self._client = self._make_client()
         self.name = f"hf({self._current})"
@@ -567,10 +567,7 @@ class _HuggingFaceProvider(_Provider):
         provider._schema_builder = build_huggingface_schema
 
         return provider.structured(
-            system=system,
-            user=user,
-            model=model,
-            timeout=timeout,
+            system=system, user=user, model=model, timeout=timeout,
         )
 
     def structured(
@@ -638,12 +635,12 @@ class _HuggingFaceProvider(_Provider):
 
 class LLMGateway:
     """
-    Central gateway for all LLM requests with provider-specific schema normalization.
+    Central gateway for all LLM requests.
     """
 
     def __init__(
         self,
-        max_retries_per_provider: int = 2,
+        max_retries_per_provider: int = 1,
         base_delay: float = 1.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         scheduler: Optional[RequestScheduler] = None,
@@ -900,25 +897,26 @@ class LLMGateway:
                         "timestamp": time.time(),
                     }
 
-                    # ★ Fast failover on permanent error (400 schema error, 401/402/403/404)
+                    # ★ Fast failover for rate limit: 10s soft cooldown (NOT 3600s!)
+                    if is_rate_limit_error(raw_error):
+                        retry_after = _extract_retry_after(raw_error)
+                        cooldown = min(15.0, retry_after or 10.0)
+                        self._scheduler.set_cooldown(provider.name, cooldown)
+                        self._task_router.record_cooldown(provider.name)
+                        logger.warning(
+                            "🚫 Rate limit '%s'. Cooldown %.1fs → next provider",
+                            provider.name,
+                            cooldown,
+                        )
+                        break
+
+                    # ★ Fast failover for permanent errors (401/402/403/404)
                     if isinstance(err, LLMPermanentError):
-                        self._scheduler.set_cooldown(provider.name, 3600.0)
+                        self._scheduler.set_cooldown(provider.name, 300.0)
                         logger.warning(
                             "🚫 Permanent error on '%s': %s → failing over to next provider",
                             provider.name,
                             err,
-                        )
-                        break
-
-                    if is_rate_limit_error(raw_error):
-                        retry_after = _extract_retry_after(raw_error)
-                        cooldown = retry_after or self._scheduler.cooldown_seconds
-                        self._scheduler.set_cooldown(provider.name, cooldown)
-                        self._task_router.record_cooldown(provider.name)
-                        logger.warning(
-                            "🚫 Rate limit from '%s'. Cooldown %.1fs → next provider.",
-                            provider.name,
-                            cooldown,
                         )
                         break
 
@@ -954,8 +952,6 @@ class LLMGateway:
                     delay = self.base_delay * (2 ** (retry_attempt - 1))
                     delay *= 1 + random.uniform(-0.1, 0.1)
                     self._sleep(max(0.5, delay))
-
-            is_first_provider = False
 
         raise last_error or LLMProviderError("All providers failed or are in cooldown")
 

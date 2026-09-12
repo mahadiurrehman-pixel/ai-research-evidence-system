@@ -2,8 +2,8 @@
 verification/scheduler.py — High-Throughput Request Scheduler.
 
 Fixes:
-- Zero sleep when provider is in cooldown: immediately raises TransientLLMError to allow instant failover.
-- Proper classification of 429/Resource Exhausted as rate limits rather than 1-hour permanent errors.
+- Rate limit (429) cooldown capped to min(15.0, retry_after or 10.0)s. NEVER 3600s!
+- Permanent errors fast-fail immediately without local retries.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _env_float(key: str, default: float) -> float:
 DEFAULT_MAX_CONCURRENCY = _env_int("SCHEDULER_MAX_CONCURRENCY", 6)
 DEFAULT_BATCH_SIZE = _env_int("SCHEDULER_BATCH_SIZE", 8)
 DEFAULT_INTER_BATCH_DELAY = _env_float("SCHEDULER_INTER_BATCH_DELAY", 0.3)
-DEFAULT_PROVIDER_COOLDOWN = _env_float("SCHEDULER_PROVIDER_COOLDOWN", 20.0)
+DEFAULT_PROVIDER_COOLDOWN = _env_float("SCHEDULER_PROVIDER_COOLDOWN", 10.0)
 DEFAULT_MAX_RETRIES = _env_int("SCHEDULER_MAX_RETRIES", 2)
 DEFAULT_BASE_RETRY_DELAY = _env_float("SCHEDULER_BASE_RETRY_DELAY", 1.0)
 
@@ -119,7 +119,7 @@ def is_timeout_error(err: Exception) -> bool:
 
 
 def is_permanent_error(err: Exception) -> bool:
-    # 429 is NEVER permanent
+    # 429 is NEVER permanent!
     if is_rate_limit_error(err):
         return False
     status = getattr(err, "status_code", None)
@@ -252,11 +252,10 @@ class RequestScheduler:
         req_id = self._next_req_id()
         last_error: Optional[Exception] = None
 
-        # ★ CRITICAL FIX: If provider is in cooldown, FAIL FAST immediately!
-        # Do NOT sleep inside the worker thread!
+        # ★ If provider is in cooldown, fail fast! Do NOT sleep inside worker thread!
         remaining = limiter.cooldown_remaining
         if remaining > 0:
-            logger.info("⏭️ [req #%d] '%s' in cooldown (%.1fs). Failing fast to switch provider.", req_id, provider_name, remaining)
+            logger.info("⏭️ [req #%d] '%s' in cooldown (%.1fs). Failing fast.", req_id, provider_name, remaining)
             raise TransientLLMError(f"Provider '{provider_name}' in cooldown ({remaining:.1f}s)")
 
         for attempt in range(1, self.max_retries + 2):
@@ -284,7 +283,8 @@ class RequestScheduler:
 
                     if is_rate_limit_error(raw_e):
                         retry_after = _extract_retry_after(raw_e)
-                        cooldown = retry_after or self.cooldown_seconds
+                        # ★ Cap 429 cooldown to 10s max (NEVER 3600s!)
+                        cooldown = min(15.0, retry_after or 10.0)
                         limiter.set_cooldown(cooldown)
                         logger.warning("🚫 [req #%d] %s RATE LIMITED by '%s'. Cooldown %.1fs. Failing fast.", req_id, label, provider_name, cooldown)
                         raise TransientLLMError(f"Rate limited by {provider_name}: {raw_e}") from raw_e
@@ -304,7 +304,7 @@ class RequestScheduler:
 
         raise last_error or TransientLLMError(f"All {self.max_retries + 1} attempts failed for {label}")
 
-    # ── Batch Processing (Parallel) ───────
+    # ── Batch Processing ──────────────────
 
     def process_batch(
         self,
