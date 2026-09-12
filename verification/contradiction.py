@@ -1,10 +1,8 @@
 """
-contradiction.py — Multi-stage contradiction pipeline with group representatives.
+contradiction.py — Multi-stage contradiction pipeline with batched scheduling.
 
-FIX: Implemented Comparability-Aware Contradiction Classification.
-Prevents opposite outcomes (positive vs null) from triggering genuine
-contradictions unless the population, intervention, metrics, and settings
-are substantially comparable.
+UPDATE: Contradiction pair comparisons now go through the RequestScheduler
+for controlled concurrency, inter-batch delays, and 429 cooldown.
 """
 
 from __future__ import annotations
@@ -12,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from itertools import combinations
-from typing import Callable, Optional, Sequence, Any
+from typing import Any, Callable, Optional, Sequence
 
 from .errors import LLMError, LLMParseError
 from .llm_client import LLMClient, default_llm_client
@@ -27,6 +25,7 @@ from .models import (
     Strength,
     SupportLevel,
 )
+from .scheduler import RequestScheduler, get_default_scheduler
 from .source_identity import (
     get_source_group,
     group_evidence,
@@ -38,27 +37,18 @@ logger = logging.getLogger(__name__)
 
 
 CONTRADICTION_SYSTEM = """\
-You are an expert academic peer reviewer. Your task is to evaluate whether two pieces of evidence genuinely contradict each other or if their differences are explained by context.
+You are an expert academic peer reviewer. Evaluate whether two pieces of evidence genuinely contradict each other.
 
 Choose EXACTLY one classification:
-- CONTRADICTORY       : The two sources make directly incompatible claims under substantially comparable conditions.
-                        Example: Both test standalone math ITS against traditional classroom lectures for K-12 students, but one finds significant grade gains while the other finds zero difference.
-- CONTEXT_DIFFERENCE  : The differing outcomes are explained by material contextual variations across key dimensions.
-                        This is NOT a genuine contradiction. Select this if they differ significantly in:
-                        * Population / Age Group (e.g., primary school children vs. university STEM vs. vocational adults)
-                        * Intervention Type (e.g., standalone adaptive tutoring software vs. human-AI hybrid/co-pilot tools vs. memory training apps)
-                        * Outcome / Performance Metric (e.g., math homework scores vs. psychology communication skills vs. cognitive transfer)
-                        * Baseline / Comparator (e.g., traditional lecturing vs. expert one-on-one human tutoring)
-- NOT_CONTRADICTORY   : The findings are aligned, complementary, or do not conflict on any meaningful claim.
-- UNCERTAIN           : There is insufficient details to evaluate comparability.
+- CONTRADICTORY       : Incompatible claims under substantially comparable conditions.
+- CONTEXT_DIFFERENCE  : Differing outcomes explained by population, intervention, metric, or setting differences.
+- NOT_CONTRADICTORY   : Findings are aligned or do not conflict.
+- UNCERTAIN           : Insufficient detail to evaluate.
 
-CRITICAL RULES:
-1. Do NOT classify a pair as CONTRADICTORY solely because one reports a positive effect and the other reports a null/negative effect. They MUST be testing comparable interventions on comparable populations with comparable metrics.
-2. If study A tests high-school math adaptive tutoring and study B tests adult vocational training, any difference in outcomes is a CONTEXT_DIFFERENCE, not a genuine contradiction.
-3. If study A evaluates standalone AI software and study B evaluates AI suggestions given to human tutors (hybrid), they are different interventions. Classify as CONTEXT_DIFFERENCE.
-4. Set is_genuine_contradiction = true ONLY for CONTRADICTORY. For all other classifications, is_genuine_contradiction = false.
+CRITICAL: Do NOT classify as CONTRADICTORY solely because one reports positive and another null. They MUST test comparable interventions on comparable populations with comparable metrics.
 
-Return the exact structured schema. Keep explanations grounded and extremely brief to conserve tokens.
+Set is_genuine_contradiction = true ONLY for CONTRADICTORY.
+Return the exact structured schema. Keep explanations brief.
 """
 
 
@@ -102,6 +92,7 @@ class ContradictionDetector:
         max_pairs: int = 200,
         semantic_threshold: float = 0.18,
         embedder: Optional[Embedder] = None,
+        scheduler: Optional[RequestScheduler] = None,  # ★ NEW
     ):
         self.llm = llm or default_llm_client()
         self.min_overlap = max(0, min_overlap)
@@ -109,6 +100,8 @@ class ContradictionDetector:
         self.semantic_threshold = semantic_threshold
         self.embedder = embedder
         self._last_raw_evidence: Optional[list[RawEvidence]] = None
+        # ★ Use provided scheduler or global default
+        self._scheduler = scheduler or get_default_scheduler()
 
     def detect(
         self,
@@ -132,11 +125,33 @@ class ContradictionDetector:
         raw_by_id = {r.source_id: r for r in (raw_evidence or [])}
         candidate_pairs = self._candidate_pairs(relevant)
 
-        pairs: list[ContradictionPair] = []
-        for a, b in candidate_pairs:
-            pair = self._llm_compare(a, b)
-            if pair is not None:
-                pairs.append(pair)
+        if not candidate_pairs:
+            return ContradictionResult(
+                has_contradictions=False,
+                contradiction_pairs=[],
+                overall_consensus="No comparable opposing evidence pairs found.",
+                context_differences=[],
+            )
+
+        # ★ BATCHED pair comparison via scheduler
+        # Instead of sequential loop, process in batches of 2 with delays
+                # ★ BATCHED pair comparison via scheduler
+        # batch_size=6 for high throughput, small delay between batches
+        def _compare(pair_tuple):
+            a, b = pair_tuple
+            return self._llm_compare(a, b)
+
+        raw_results = self._scheduler.process_batch(
+            items=candidate_pairs,
+            fn=_compare,
+            batch_size=6,          # ★ was 2, now 6
+            batch_delay=0.3,       # ★ was 1.5, now 0.3
+            provider_name="contradiction",
+            label="contradiction_pairs",
+        )
+
+        # Filter out None (failed) results
+        pairs: list[ContradictionPair] = [r for r in raw_results if r is not None]
 
         consensus = self._weighted_consensus(relevant, raw_by_id)
 
@@ -158,7 +173,6 @@ class ContradictionDetector:
     def _candidate_pairs(
         self, evidence: list[AnalyzedEvidence]
     ) -> list[tuple[AnalyzedEvidence, AnalyzedEvidence]]:
-        # Group evidence by source group
         raw_by_id = {r.source_id: r for r in (self._last_raw_evidence or [])}
 
         groups: dict[str, list[AnalyzedEvidence]] = {}
@@ -198,7 +212,6 @@ class ContradictionDetector:
             best = max(members, key=_quality_score)
             representatives.append(best)
 
-        # Generate pairs from representatives with differing support levels
         stage1: list[tuple[AnalyzedEvidence, AnalyzedEvidence]] = []
         for a, b in combinations(representatives, 2):
             if a.support_level == b.support_level:
@@ -208,7 +221,6 @@ class ContradictionDetector:
                 continue
             stage1.append((a, b))
 
-        # Fallback: if no cross-group pairs found, use all evidence
         if not stage1:
             for a, b in combinations(evidence, 2):
                 if a.support_level == b.support_level:
@@ -223,11 +235,9 @@ class ContradictionDetector:
         if not stage1:
             return []
 
-        # Adaptive bypass for small datasets
         if len(stage1) <= 5:
             return stage1[:self.max_pairs]
 
-        # Stage 2+3: lexical + semantic scoring (Only for larger datasets)
         scored: list[tuple[float, AnalyzedEvidence, AnalyzedEvidence]] = []
         texts_a = [f"{p[0].key_claim} {p[0].reason}" for p in stage1]
         texts_b = [f"{p[1].key_claim} {p[1].reason}" for p in stage1]
@@ -274,7 +284,7 @@ class ContradictionDetector:
             f"- Strength: {b.strength.value}\n"
             f"- Methodology: {b.methodology_note}\n"
             f"- Reason: {b.reason}\n\n"
-            "Classify the relationship. Ensure you evaluate context comparability (population, intervention type, metric) before deciding contradiction."
+            "Classify the relationship. Evaluate comparability before deciding contradiction."
         )
         try:
             pair = self.llm.structured_call(

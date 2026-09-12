@@ -1126,3 +1126,80 @@ def test_sp2_positive_vs_null_not_automatic_contradiction():
     ])
     assert r.has_contradictions is False
     assert r.contradiction_pairs[0].classification == ContradictionClass.CONTEXT_DIFFERENCE
+
+# ═════════════════════════════════════════════
+# DYNAMIC FAILOVER INTEGRATION TESTS
+# ═════════════════════════════════════════════
+def test_sp3_hf_timeout_failover_without_multiple_retries():
+    """
+    Verify that a timeout on HuggingFace immediately switches to Gemini/Groq
+    without making multiple redundant retries on the timed-out provider.
+    """
+    from m1.config import CONFIG
+    from m1.gateway import LLMGateway
+    from m1.errors import LLMProviderError
+    from verification.scheduler import RequestScheduler
+    from verification.models import FinalVerdict, VerdictType, Confidence
+
+    # Create a custom scheduler with low delays for fast execution
+    scheduler = RequestScheduler(
+        max_concurrency=2,
+        batch_delay=0.1,
+        max_retries=3,
+        base_retry_delay=0.1,
+        cooldown_seconds=10.0,
+    )
+
+    class MockHFProvider:
+        name = "hf(Qwen/Qwen2.5-72B-Instruct)"
+        calls = 0
+        def structured(self, s, u, model, timeout=None):
+            MockHFProvider.calls += 1
+            raise TimeoutError("Connection timed out (mock HF timeout)")
+
+    class MockGeminiProvider:
+        name = "gemini(gemini-3.1-flash-lite)"
+        calls = 0
+        def structured(self, s, u, model, timeout=None):
+            MockGeminiProvider.calls += 1
+            return FinalVerdict(
+                original_question="Is AI good?",
+                verdict=VerdictType.SUPPORTED,
+                confidence=Confidence.HIGH,
+                summary="AI is highly beneficial.",
+                detailed_reasoning="Consensus shows positive outcome.",
+            )
+
+    MockHFProvider.calls = 0
+    MockGeminiProvider.calls = 0
+
+    # Build a custom gateway
+    gateway = LLMGateway(scheduler=scheduler)
+    gateway._providers = [MockHFProvider(), MockGeminiProvider()]
+    gateway._provider_map = {
+        "hf(Qwen/Qwen2.5-72B-Instruct)": gateway._providers[0],
+        "gemini(gemini-3.1-flash-lite)": gateway._providers[1],
+    }
+
+    # Explicitly test HF priority to verify failover to Gemini on timeout
+    gateway._task_router.select_providers = lambda task_type, avail, cooled_down_providers=None: [
+        p for p in ["hf(Qwen/Qwen2.5-72B-Instruct)", "gemini(gemini-3.1-flash-lite)"]
+        if p in avail
+    ]
+
+    # Run structured_call for the final_verdict task
+    result = gateway.structured_call(
+        system="system",
+        user="user",
+        response_model=FinalVerdict,
+        task_type="final_verdict"
+    )
+
+    # Assertions:
+    # 1. HF was called exactly ONCE (fail-fast on timeout!)
+    assert MockHFProvider.calls == 1, f"Expected 1 call, got {MockHFProvider.calls}"
+    # 2. Gemini was called next and succeeded
+    assert MockGeminiProvider.calls == 1, f"Expected 1 call on fallback, got {MockGeminiProvider.calls}"
+    assert result.verdict == VerdictType.SUPPORTED
+    # 3. HF is now marked in cooldown
+    assert scheduler.is_in_cooldown("hf(Qwen/Qwen2.5-72B-Instruct)") is True

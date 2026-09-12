@@ -1,21 +1,76 @@
-.env
-.env.*
-!.env.example
-
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
 .venv/
 venv/
-node_modules/
+ENV/
+env/
+ENV/bin/
+venv_ast/
 
+# Pytest / Testing
+.pytest_cache/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
 *.log
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# Environment secrets (CRITICAL: Do not commit API keys!)
+.env
+.env.local
+.env.production
+.env.development
+.env.example.local
+
+# Operating System Files
 .DS_Store
+Thumbs.db
+db.sqlite3
 
-# Generated outputs
-outputs/
-results/
-cache/
+# Local Cache / Temporary folders
+.cache/
+.mypy_cache/
+.ruff_cache/
 
-# Secrets
-secrets/
-*.pem
+# M4 storage
+storage/
+*.db
+research_history.db
+vector_db/
+chroma_db/

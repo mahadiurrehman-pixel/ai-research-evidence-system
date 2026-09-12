@@ -51,6 +51,18 @@ from .source_identity import (
     normalize_domain,
     normalize_title,
 )
+from .task_router import (
+    TaskRouter,
+    get_default_task_router,
+    TASK_POLICY,
+    TIER_PREFERENCES,
+)
+from .scheduler import (
+    RequestScheduler,
+    ScheduledLLMClient,
+    get_default_scheduler,
+    is_rate_limit_error,
+)
 from .weighting import WeightBreakdown, calculate_evidence_weight
 
 __all__ = [
@@ -108,4 +120,13 @@ __all__ = [
     "TransientLLMError",
     "PermanentLLMError",
     "PipelineStateError",
+    "RequestScheduler",
+    "ScheduledLLMClient",
+    "get_default_scheduler",
+    "is_rate_limit_error",
+    # In __all__:
+    "TaskRouter",
+    "get_default_task_router",
+    "TASK_POLICY",
+    "TIER_PREFERENCES",
 ]

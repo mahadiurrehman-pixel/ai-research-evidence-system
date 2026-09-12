@@ -1,5 +1,8 @@
 """
-pipeline.py — Wires the verification steps together.
+verification/pipeline.py — Wires the verification steps together.
+
+UPDATE: Creates task-specific ScheduledLLMClient instances so each
+M3 module routes to the optimal provider tier.
 """
 
 from __future__ import annotations
@@ -23,6 +26,11 @@ from .models import (
     RawEvidence,
     ResearchGap,
     VerificationResult,
+)
+from .scheduler import (
+    RequestScheduler,
+    ScheduledLLMClient,
+    get_default_scheduler,
 )
 from .verifier import EvidenceVerifier
 
@@ -58,17 +66,48 @@ class VerificationPipeline:
         self,
         llm: LLMClient | None = None,
         max_rounds: int = 3,
+        scheduler: Optional[RequestScheduler] = None,
     ):
         if max_rounds < 1:
             raise ValueError("max_rounds must be >= 1")
-        self.llm = llm or default_llm_client()
+
+        self._scheduler = scheduler or get_default_scheduler()
+        raw_llm = llm or default_llm_client()
+
+        # ★ Task-specific LLM clients for each M3 module
+        # Each client passes its task_type to the inner LLM (LLMGateway),
+        # which uses TaskRouter to select the optimal provider.
+        self._decomp_llm = ScheduledLLMClient(
+            inner=raw_llm, scheduler=self._scheduler,
+            provider_name="m3-decomp", task_type="decomposition",
+        )
+        self._analyzer_llm = ScheduledLLMClient(
+            inner=raw_llm, scheduler=self._scheduler,
+            provider_name="m3-analyzer", task_type="evidence_extraction",
+        )
+        self._contradiction_llm = ScheduledLLMClient(
+            inner=raw_llm, scheduler=self._scheduler,
+            provider_name="m3-contradiction", task_type="contradiction_detection",
+        )
+        self._judge_llm = ScheduledLLMClient(
+            inner=raw_llm, scheduler=self._scheduler,
+            provider_name="m3-judge", task_type="final_verdict",
+        )
+
         self.max_rounds = max_rounds
 
-        self.decomposer = QuestionDecomposer(self.llm)
-        self.analyzer = EvidenceAnalyzer(self.llm)
-        self.detector = ContradictionDetector(self.llm)
-        self.verifier = EvidenceVerifier(self.llm)
-        self.judge = ResearchJudge(self.llm)
+        # Each module uses its task-specific client
+        self.decomposer = QuestionDecomposer(self._decomp_llm)
+        self.analyzer = EvidenceAnalyzer(self._analyzer_llm)
+        self.detector = ContradictionDetector(
+            llm=self._contradiction_llm,
+            scheduler=self._scheduler,
+        )
+        self.verifier = EvidenceVerifier(self._judge_llm)
+        self.judge = ResearchJudge(self._judge_llm)
+
+        # Keep a reference for backward compatibility
+        self.llm = self._judge_llm
 
     def run(
         self,
@@ -164,7 +203,6 @@ class VerificationPipeline:
 
         if sufficient or max_reached or force_judge:
             state.status = "judging"
-            # ★ Pass raw_evidence to judge for accurate group counting
             state.final_verdict = self.judge.judge(
                 decomposition=state.decomposition,
                 analyzed_evidence=state.analyzed_evidence,
