@@ -56,11 +56,12 @@ class _FakeM3Pipeline:
         self.run_calls = 0
         self.continue_calls = 0
 
-    def run(self, question, evidence, complexity=None):
+    # ★ FIX: Added **kwargs to safely accept sub_questions and other optional args
+    def run(self, question, evidence, complexity=None, **kwargs):
         self.run_calls += 1
         return self._pop()
 
-    def run_continue(self, state, new_evidence, complexity=None):
+    def run_continue(self, state, new_evidence, complexity=None, **kwargs):
         self.continue_calls += 1
         return self._pop()
 

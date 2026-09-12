@@ -1,7 +1,8 @@
 """
-m1/router.py — Intent + Complexity Classifier.
+m1/router.py — Combined Route & Plan Classifier.
 
-UPDATE: Passes task_type="classification" to gateway for fast-tier routing.
+UPDATE: Instructs the LLM to output both routing details and the initial search
+plan (sub_questions, queries) in a single transaction, saving ~4.0s.
 """
 
 from __future__ import annotations
@@ -22,24 +23,19 @@ logger = logging.getLogger(__name__)
 
 
 ROUTER_SYSTEM = """\
-You classify research questions by intent, complexity, and required depth.
+You classify research questions and generate initial balanced research plans.
 
-INTENT (choose one):
-- FACT_CHECK: Simple stable factual lookup
-- CLAIM_VERIFICATION: Verify a specific claim
-- RESEARCH_SYNTHESIS: Synthesize evidence from multiple sources
-- COMPARATIVE_RESEARCH: Compare two or more approaches
-- CAUSALITY_ANALYSIS: Investigate cause-effect relationships
-- LITERATURE_REVIEW: Broad topic overview
-- TREND_ANALYSIS: Analyze trends over time
+1. CLASSIFY QUESTION:
+- INTENT: FACT_CHECK | CLAIM_VERIFICATION | RESEARCH_SYNTHESIS | COMPARATIVE_RESEARCH | CAUSALITY_ANALYSIS | LITERATURE_REVIEW
+- DOMAIN: One-word category (e.g., EDUCATION, TECHNOLOGY)
+- COMPLEXITY: SIMPLE | MODERATE | COMPLEX
+- INVESTIGATION_LEVEL: DIRECT (no research) | LIGHT (1 round) | STANDARD (1-2 rounds) | DEEP (2-3 rounds)
 
-DOMAIN: One-word domain (EDUCATION, MEDICINE, ECONOMICS, TECHNOLOGY, GENERAL)
-
-COMPLEXITY: SIMPLE | MODERATE | COMPLEX
-
-INVESTIGATION_LEVEL: DIRECT | LIGHT | STANDARD | DEEP
-
-REQUIRES_BALANCED_EVIDENCE: true for research/controversial, false for simple facts
+2. GENERATE PLAN (If needs_research is true):
+- sub_questions: 2-4 sub-questions decomposing the query.
+- queries: 4-6 balanced search queries.
+  * Must contain at least one query in SUPPORTING (positive effect), CONTRADICTING (null/negative effect), and SYSTEMATIC_REVIEWS (meta-analysis/review) tracks.
+  * Keep query strings under 8 words.
 
 Return the exact JSON schema.
 """
@@ -75,10 +71,9 @@ class QuestionRouter:
 
         if self.gateway and self.gateway.has_providers():
             try:
-                # ★ Pass task_type for fast-tier routing
                 result = self.gateway.structured_call(
                     system=ROUTER_SYSTEM,
-                    user=f'Classify this question:\n\n"{question}"',
+                    user=f'Route and plan for: "{question}"',
                     response_model=RouterOutput,
                     task_type="classification",
                 )

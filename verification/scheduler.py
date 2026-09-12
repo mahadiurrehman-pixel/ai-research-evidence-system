@@ -1,8 +1,9 @@
 """
 verification/scheduler.py — High-Throughput Request Scheduler.
 
-Optimized for speed while preventing 429 rate-limit errors.
-Immediately raises rate-limit, timeout, and connection errors to allow instant cross-key failover.
+Fixes:
+- Zero sleep when provider is in cooldown: immediately raises TransientLLMError to allow instant failover.
+- Proper classification of 429/Resource Exhausted as rate limits rather than 1-hour permanent errors.
 """
 
 from __future__ import annotations
@@ -44,17 +45,18 @@ def _env_float(key: str, default: float) -> float:
 DEFAULT_MAX_CONCURRENCY = _env_int("SCHEDULER_MAX_CONCURRENCY", 6)
 DEFAULT_BATCH_SIZE = _env_int("SCHEDULER_BATCH_SIZE", 8)
 DEFAULT_INTER_BATCH_DELAY = _env_float("SCHEDULER_INTER_BATCH_DELAY", 0.3)
-DEFAULT_PROVIDER_COOLDOWN = _env_float("SCHEDULER_PROVIDER_COOLDOWN", 30.0)
-DEFAULT_MAX_RETRIES = _env_int("SCHEDULER_MAX_RETRIES", 3)
-DEFAULT_BASE_RETRY_DELAY = _env_float("SCHEDULER_BASE_RETRY_DELAY", 1.5)
+DEFAULT_PROVIDER_COOLDOWN = _env_float("SCHEDULER_PROVIDER_COOLDOWN", 20.0)
+DEFAULT_MAX_RETRIES = _env_int("SCHEDULER_MAX_RETRIES", 2)
+DEFAULT_BASE_RETRY_DELAY = _env_float("SCHEDULER_BASE_RETRY_DELAY", 1.0)
 
 
 # ── Error Detection Helpers ───────────────────
 
 _RATE_LIMIT_TOKENS = (
     "429", "rate_limit", "rate limit", "rate-limit",
-    "too many requests", "quota exceeded", "tpm limit",
+    "too many requests", "tpm limit", "rpm limit",
     "requests per minute", "tokens per minute",
+    "resource_exhausted", "quota exceeded", "quotaexceeded",
 )
 
 _CONNECTION_ERROR_TOKENS = (
@@ -62,39 +64,77 @@ _CONNECTION_ERROR_TOKENS = (
     "connecterror", "network is unreachable", "name or service not known",
     "temporary failure in name resolution", "remote disconnected", "remote end closed connection",
     "connection closed", "failed to establish a new connection", "max retries exceeded with url",
-    "dns failure",
+    "dns failure", "unexpected_eof_while_reading", "eof occurred in violation of protocol",
+)
+
+_PERMANENT_TOKENS = (
+    "invalid api key",
+    "invalid_api_key",
+    "unauthorized",
+    "401",
+    "402",
+    "payment required",
+    "payment_required",
+    "forbidden",
+    "403",
+    "404",
+    "invalid_request",
+    "permission denied",
+    "authentication",
+    "api key",
+    "no auth credentials",
+    "additionalproperties",
+    "unsupported parameter",
+    "unsupported_parameter",
+    "invalid parameter",
+    "extra inputs are not permitted",
+    "response_format",
+    "unknown model",
+    "model not found",
+    "model_not_found",
+    "does not exist",
+    "unsupported model",
 )
 
 
 def is_rate_limit_error(err: Exception) -> bool:
-    """Detect HTTP 429 or rate-limit errors from any provider."""
     status = getattr(err, "status_code", None)
     if status == 429:
         return True
     response = getattr(err, "response", None)
-    if response is not None:
-        if getattr(response, "status_code", None) == 429:
-            return True
+    if response is not None and getattr(response, "status_code", None) == 429:
+        return True
     msg = str(err).lower()
     return any(tok in msg for tok in _RATE_LIMIT_TOKENS)
 
 
 def is_connection_error(err: Exception) -> bool:
-    """Detect connection and network-level errors."""
     msg = str(err).lower()
     return any(tok in msg for tok in _CONNECTION_ERROR_TOKENS)
 
 
 def is_timeout_error(err: Exception) -> bool:
-    """Detect timeout errors."""
     msg = str(err).lower()
     return "timeout" in msg or "timed out" in msg or "read timeout" in msg or "connect timeout" in msg
 
 
+def is_permanent_error(err: Exception) -> bool:
+    # 429 is NEVER permanent
+    if is_rate_limit_error(err):
+        return False
+    status = getattr(err, "status_code", None)
+    if status in (401, 402, 403, 404):
+        return True
+    response = getattr(err, "response", None)
+    if response is not None and getattr(response, "status_code", None) in (401, 402, 403, 404):
+        return True
+    msg = str(err).lower()
+    return any(tok in msg for tok in _PERMANENT_TOKENS)
+
+
 def _extract_retry_after(err: Exception) -> Optional[float]:
-    """Extract Retry-After seconds from error headers or message."""
     msg = str(err)
-    m = re.search(r"(?:try again in|wait|retry after)\s*([0-9.]+)\s*s?", msg, re.I)
+    m = re.search(r"(?:try again in|wait|retry after|retry in|retrydelay': ')\s*([0-9.]+)\s*s?", msg, re.I)
     if m:
         try:
             return max(1.0, float(m.group(1)))
@@ -117,8 +157,6 @@ def _extract_retry_after(err: Exception) -> Optional[float]:
 # ── Per-Provider Rate Limiter ────────────────
 
 class _ProviderLimiter:
-    """Thread-safe per-provider cooldown and concurrency tracker."""
-
     def __init__(self, name: str, max_concurrent: int, cooldown_seconds: float):
         self.name = name
         self.semaphore = threading.Semaphore(max_concurrent)
@@ -140,21 +178,12 @@ class _ProviderLimiter:
         duration = seconds or self.cooldown_seconds
         with self._lock:
             self._cooldown_until = time.time() + duration
-        logger.warning(
-            "🧊 COOLDOWN: '%s' paused for %.1fs", self.name, duration
-        )
+        logger.warning("🧊 COOLDOWN: '%s' paused for %.1fs", self.name, duration)
 
 
 # ── Request Scheduler ────────────────────────
 
 class RequestScheduler:
-    """
-    High-throughput request scheduler with real parallelism.
-
-    Uses ThreadPoolExecutor for actual concurrent execution.
-    Per-provider cooldowns ensure one provider's 429 doesn't block others.
-    """
-
     def __init__(
         self,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
@@ -175,16 +204,13 @@ class RequestScheduler:
             max_workers=max_concurrency,
             thread_name_prefix="m3-sched",
         )
-
         self._limiters: Dict[str, _ProviderLimiter] = {}
         self._limiters_lock = threading.Lock()
-
         self._counter = 0
         self._counter_lock = threading.Lock()
 
         logger.info(
-            "🔧 Scheduler created: concurrency=%d, batch_size=%d, "
-            "batch_delay=%.2fs, cooldown=%.0fs",
+            "🔧 Scheduler created: concurrency=%d, batch_size=%d, batch_delay=%.2fs, cooldown=%.0fs",
             max_concurrency, batch_size, batch_delay, cooldown_seconds,
         )
 
@@ -221,39 +247,24 @@ class RequestScheduler:
         provider_name: str = "default",
         request_label: str = "",
     ) -> T:
-        """
-        Execute a single LLM request with retry and per-provider cooldown.
-
-        NO inter-request delay — single calls (like FinalVerdict) run instantly.
-        """
         label = request_label or "request"
         limiter = self._get_limiter(provider_name)
         req_id = self._next_req_id()
         last_error: Optional[Exception] = None
 
-        for attempt in range(1, self.max_retries + 2):
-            # Wait if provider is in cooldown
-            remaining = limiter.cooldown_remaining
-            if remaining > 0:
-                logger.info(
-                    "⏳ [req #%d] '%s' cooldown (%.1fs). Waiting...",
-                    req_id, provider_name, remaining,
-                )
-                time.sleep(remaining + 0.2)
+        # ★ CRITICAL FIX: If provider is in cooldown, FAIL FAST immediately!
+        # Do NOT sleep inside the worker thread!
+        remaining = limiter.cooldown_remaining
+        if remaining > 0:
+            logger.info("⏭️ [req #%d] '%s' in cooldown (%.1fs). Failing fast to switch provider.", req_id, provider_name, remaining)
+            raise TransientLLMError(f"Provider '{provider_name}' in cooldown ({remaining:.1f}s)")
 
-            # Acquire per-provider slot
+        for attempt in range(1, self.max_retries + 2):
             with limiter.semaphore:
-                logger.info(
-                    "📤 [req #%d] %s via '%s' (attempt %d/%d)",
-                    req_id, label, provider_name,
-                    attempt, self.max_retries + 1,
-                )
+                logger.info("📤 [req #%d] %s via '%s' (attempt %d/%d)", req_id, label, provider_name, attempt, self.max_retries + 1)
                 try:
                     result = fn()
-                    logger.info(
-                        "✅ [req #%d] %s via '%s' OK (attempt %d)",
-                        req_id, label, provider_name, attempt,
-                    )
+                    logger.info("✅ [req #%d] %s via '%s' OK (attempt %d)", req_id, label, provider_name, attempt)
                     return result
 
                 except LLMParseError:
@@ -267,58 +278,31 @@ class RequestScheduler:
                 except Exception as raw_e:
                     last_error = raw_e
 
+                    if is_permanent_error(raw_e):
+                        logger.warning("🚫 [req #%d] %s PERMANENT ERROR on '%s': %s. Failing fast.", req_id, label, provider_name, raw_e)
+                        raise PermanentLLMError(str(raw_e)) from raw_e
+
                     if is_rate_limit_error(raw_e):
                         retry_after = _extract_retry_after(raw_e)
                         cooldown = retry_after or self.cooldown_seconds
                         limiter.set_cooldown(cooldown)
-                        logger.warning(
-                            "🚫 [req #%d] %s RATE LIMITED by '%s'. "
-                            "Cooldown %.1fs. Failing fast to allow failover.",
-                            req_id, label, provider_name, cooldown
-                        )
-                        # Immediately raise TransientLLMError to trigger instant failover in gateway
-                        raise TransientLLMError(
-                            f"Rate limited by {provider_name}: {raw_e}"
-                        ) from raw_e
+                        logger.warning("🚫 [req #%d] %s RATE LIMITED by '%s'. Cooldown %.1fs. Failing fast.", req_id, label, provider_name, cooldown)
+                        raise TransientLLMError(f"Rate limited by {provider_name}: {raw_e}") from raw_e
 
-                    if is_timeout_error(raw_e):
-                        logger.warning(
-                            "⏱️ [req #%d] %s TIMEOUT on '%s'. "
-                            "Failing fast to allow immediate provider failover.",
-                            req_id, label, provider_name
-                        )
-                        # Immediately raise TransientLLMError to switch provider without local retry loop
-                        raise TransientLLMError(
-                            f"Timeout on {provider_name}: {raw_e}"
-                        ) from raw_e
+                    if is_timeout_error(raw_e) or is_connection_error(raw_e):
+                        logger.warning("⏱️ [req #%d] %s TIMEOUT/CONN ERROR on '%s'. Failing fast.", req_id, label, provider_name)
+                        raise TransientLLMError(f"Network error on {provider_name}: {raw_e}") from raw_e
 
-                    if is_connection_error(raw_e):
-                        logger.warning(
-                            "🌐 [req #%d] %s CONNECTION ERROR on '%s'. "
-                            "Failing fast to allow immediate provider failover.",
-                            req_id, label, provider_name
-                        )
-                        raise TransientLLMError(
-                            f"Connection error on {provider_name}: {raw_e}"
-                        ) from raw_e
-
-                    logger.warning(
-                        "⚠️  [req #%d] %s FAILED via '%s': %s (%d/%d)",
-                        req_id, label, provider_name, raw_e,
-                        attempt, self.max_retries + 1,
-                    )
+                    logger.warning("⚠️  [req #%d] %s FAILED via '%s': %s (%d/%d)", req_id, label, provider_name, raw_e, attempt, self.max_retries + 1)
 
                     if attempt > self.max_retries:
                         break
 
                     delay = self.base_retry_delay * (2 ** (attempt - 1))
                     delay *= 1 + random.uniform(-0.15, 0.15)
-                    delay = max(0.5, delay)
-                    time.sleep(delay)
+                    time.sleep(max(0.5, delay))
 
-        raise last_error or TransientLLMError(
-            f"All {self.max_retries + 1} attempts failed for {label}"
-        )
+        raise last_error or TransientLLMError(f"All {self.max_retries + 1} attempts failed for {label}")
 
     # ── Batch Processing (Parallel) ───────
 
@@ -340,19 +324,12 @@ class RequestScheduler:
         total_batches = len(batches)
         all_results: List[Any] = [None] * len(items)
 
-        logger.info(
-            "📦 BATCH START: %s — %d items, %d batches (size=%d, delay=%.2fs, concurrency=%d)",
-            label, len(items), total_batches, bs, delay, self.max_concurrency,
-        )
+        logger.info("📦 BATCH START: %s — %d items, %d batches (size=%d, delay=%.2fs, concurrency=%d)", label, len(items), total_batches, bs, delay, self.max_concurrency)
 
         for batch_idx, batch in enumerate(batches):
             batch_offset = batch_idx * bs
-            logger.info(
-                "📦 Batch %d/%d: %d items [%s]",
-                batch_idx + 1, total_batches, len(batch), label,
-            )
+            logger.info("📦 Batch %d/%d: %d items [%s]", batch_idx + 1, total_batches, len(batch), label)
 
-            # Submit all items in this batch to thread pool concurrently
             future_to_idx = {}
             for local_idx, item in enumerate(batch):
                 global_idx = batch_offset + local_idx
@@ -366,7 +343,6 @@ class RequestScheduler:
                 )
                 future_to_idx[future] = global_idx
 
-            # Collect results as they complete
             for future in as_completed(future_to_idx):
                 global_idx = future_to_idx[future]
                 try:
@@ -375,148 +351,23 @@ class RequestScheduler:
                     logger.error("❌ %s[%d] FAILED: %s", label, global_idx, e)
                     all_results[global_idx] = None
 
-            # Small inter-batch delay (not after last batch)
             if batch_idx < total_batches - 1 and delay > 0:
-                logger.debug(
-                    "⏳ Inter-batch delay: %.2fs", delay,
-                )
                 time.sleep(delay)
 
         succeeded = sum(1 for r in all_results if r is not None)
         failed = len(all_results) - succeeded
-        logger.info(
-            "📦 BATCH DONE: %s — %d/%d succeeded, %d failed",
-            label, succeeded, len(all_results), failed,
-        )
+        logger.info("📦 BATCH DONE: %s — %d/%d succeeded, %d failed", label, succeeded, len(all_results), failed)
         return all_results
 
-    def _execute_batch_item(
-        self,
-        fn: Callable[[Any], Any],
-        item: Any,
-        provider_name: str,
-        request_label: str,
-    ) -> Any:
-        """Execute a single batch item with retry (runs inside thread pool)."""
-        return self.execute(
-            fn=lambda: fn(item),
-            provider_name=provider_name,
-            request_label=request_label,
-        )
-
-    # ── Multi-Provider Distribution ───────
-
-    def process_batch_distributed(
-        self,
-        items: Sequence[Any],
-        fn: Callable[[Any, str], Any],
-        providers: List[str],
-        batch_size: Optional[int] = None,
-        batch_delay: Optional[float] = None,
-        label: str = "batch",
-    ) -> List[Any]:
-        if not items:
-            return []
-        if not providers:
-            return self.process_batch(items, lambda x: fn(x, "default"),
-                                      batch_size, batch_delay, "default", label)
-
-        bs = batch_size or self.batch_size
-        delay = batch_delay if batch_delay is not None else self.batch_delay
-        all_results: List[Any] = [None] * len(items)
-
-        logger.info(
-            "📦 DISTRIBUTED BATCH: %s — %d items across %d providers (%s)",
-            label, len(items), len(providers), ", ".join(providers),
-        )
-
-        assignments: Dict[str, List[tuple[int, Any]]] = {p: [] for p in providers}
-        provider_idx = 0
-
-        for global_idx, item in enumerate(items):
-            tried = 0
-            while tried < len(providers):
-                p = providers[provider_idx % len(providers)]
-                provider_idx += 1
-                if not self.is_in_cooldown(p):
-                    assignments[p].append((global_idx, item))
-                    break
-                tried += 1
-            else:
-                p = providers[0]
-                assignments[p].append((global_idx, item))
-
-        futures = {}
-        for provider, provider_items in assignments.items():
-            if not provider_items:
-                continue
-            batches = [
-                provider_items[i:i + bs]
-                for i in range(0, len(provider_items), bs)
-            ]
-            for batch_idx, batch in enumerate(batches):
-                for local_idx, (global_idx, item) in enumerate(batch):
-                    item_label = f"{label}[{global_idx}]@{provider}"
-                    future = self._pool.submit(
-                        self._execute_distributed_item,
-                        fn=fn,
-                        item=item,
-                        provider_name=provider,
-                        request_label=item_label,
-                    )
-                    futures[future] = global_idx
-
-                if batch_idx < len(batches) - 1 and delay > 0:
-                    time.sleep(delay)
-
-        for future in as_completed(futures):
-            global_idx = futures[future]
-            try:
-                all_results[global_idx] = future.result()
-            except Exception as e:
-                logger.error("❌ %s[%d] FAILED: %s", label, global_idx, e)
-                all_results[global_idx] = None
-
-        succeeded = sum(1 for r in all_results if r is not None)
-        logger.info(
-            "📦 DISTRIBUTED DONE: %s — %d/%d succeeded",
-            label, succeeded, len(all_results),
-        )
-        return all_results
-
-    def _execute_distributed_item(
-        self,
-        fn: Callable[[Any, str], Any],
-        item: Any,
-        provider_name: str,
-        request_label: str,
-    ) -> Any:
-        return self.execute(
-            fn=lambda: fn(item, provider_name),
-            provider_name=provider_name,
-            request_label=request_label,
-        )
+    def _execute_batch_item(self, fn: Callable[[Any], Any], item: Any, provider_name: str, request_label: str) -> Any:
+        return self.execute(fn=lambda: fn(item), provider_name=provider_name, request_label=request_label)
 
     def shutdown(self, wait: bool = True) -> None:
         self._pool.shutdown(wait=wait)
 
 
-# ── Scheduled LLM Client Wrapper ─────────────
-
 class ScheduledLLMClient:
-    """
-    Drop-in wrapper that adds scheduling to any LLMClient.
-
-    Implements the same protocol (structured_call, text_call).
-    """
-
-    def __init__(
-        self,
-        inner: Any,
-        scheduler: RequestScheduler,
-        provider_name: str = "default",
-        task_type: str = "default",
-    ):
+    def __init__(self, inner: Any, scheduler: RequestScheduler, provider_name: str = "default", task_type: str = "default"):
         self._inner = inner
         self._scheduler = scheduler
         self._provider = provider_name
@@ -524,21 +375,11 @@ class ScheduledLLMClient:
 
     def structured_call(self, system: str, user: str, response_model: Type[T], **kwargs) -> T:
         task = kwargs.pop("task_type", self._task_type)
-        return self._scheduler.execute(
-            fn=lambda: self._call_inner(
-                "structured_call", system, user, response_model, task_type=task
-            ),
-            provider_name=self._provider,
-            request_label=f"{task}:structured<{response_model.__name__}>",
-        )
+        return self._call_inner("structured_call", system, user, response_model, task_type=task)
 
-    def text_call(self, system: str, user: str, **kwargs) -> str:
+    def text_call(self, system, user, **kwargs) -> str:
         task = kwargs.pop("task_type", self._task_type)
-        return self._scheduler.execute(
-            fn=lambda: self._call_inner("text_call", system, user, task_type=task),
-            provider_name=self._provider,
-            request_label=f"{task}:text_call",
-        )
+        return self._call_inner("text_call", system, user, task_type=task)
 
     def _call_inner(self, method: str, *args, **kwargs):
         fn = getattr(self._inner, method)
@@ -548,8 +389,6 @@ class ScheduledLLMClient:
             kwargs.pop("task_type", None)
             return fn(*args, **kwargs)
 
-
-# ── Global Default Scheduler ─────────────────
 
 _default_scheduler: Optional[RequestScheduler] = None
 _default_lock = threading.Lock()

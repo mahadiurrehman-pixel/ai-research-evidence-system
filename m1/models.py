@@ -1,8 +1,8 @@
 """
 m1/models.py — All Pydantic data models for M1.
 
-FIX: Added raw_evidence field to InvestigationState using standard Pydantic Field
-to allow engine.py to sync evidence cumulatively across rounds.
+UPDATE: Added sub_questions and queries to RouterOutput to support
+combined single-call routing and planning.
 """
 
 from __future__ import annotations
@@ -49,10 +49,10 @@ class ResearchIntent(str, Enum):
 
 
 class InvestigationLevel(str, Enum):
-    DIRECT = "DIRECT"       # No research; direct answer
-    LIGHT = "LIGHT"         # 1 round, 2-3 sources
-    STANDARD = "STANDARD"   # 1-2 rounds, 5-8 sources
-    DEEP = "DEEP"           # 2-3 rounds, 10+ sources
+    DIRECT = "DIRECT"
+    LIGHT = "LIGHT"
+    STANDARD = "STANDARD"
+    DEEP = "DEEP"
 
 
 class QueryTrack(str, Enum):
@@ -72,18 +72,6 @@ class CacheFreshness(str, Enum):
     EXPIRED = "EXPIRED"
 
 
-# ── Router ────────────────────────────────────
-
-class RouterOutput(BaseModel):
-    intent: ResearchIntent = ResearchIntent.RESEARCH_SYNTHESIS
-    domain: str = "GENERAL"
-    complexity: QuestionComplexity = QuestionComplexity.MODERATE
-    needs_research: bool = True
-    investigation_level: InvestigationLevel = InvestigationLevel.STANDARD
-    requires_balanced_evidence: bool = True
-    reason: str = ""
-
-
 # ── Planner ───────────────────────────────────
 
 class SearchQuery(BaseModel):
@@ -100,6 +88,22 @@ class ResearchPlan(BaseModel):
     queries: list[SearchQuery] = Field(default_factory=list)
     evidence_target: int = 10
     max_rounds: int = 3
+
+
+# ── Router ────────────────────────────────────
+
+class RouterOutput(BaseModel):
+    intent: ResearchIntent = ResearchIntent.RESEARCH_SYNTHESIS
+    domain: str = "GENERAL"
+    complexity: QuestionComplexity = QuestionComplexity.MODERATE
+    needs_research: bool = True
+    investigation_level: InvestigationLevel = InvestigationLevel.STANDARD
+    requires_balanced_evidence: bool = True
+    reason: str = ""
+    
+    # ★ COMBINED ROUTE & PLAN: Generate plan fields inside router to skip 1 LLM call!
+    sub_questions: list[str] = Field(default_factory=list)
+    queries: list[SearchQuery] = Field(default_factory=list)
 
 
 # ── State & Trace ────────────────────────────
@@ -131,9 +135,6 @@ class InvestigationState(BaseModel):
     errors: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
-    
-    # ★ FIX: Correct Pydantic field definition for raw_evidence
-    # Uses Any to avoid circular import from verification.models
     raw_evidence: list[Any] = Field(default_factory=list)
 
     def log(self, action: str, details: str = "") -> None:

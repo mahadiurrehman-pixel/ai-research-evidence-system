@@ -1,5 +1,5 @@
 """
-decomposer.py — Decompose a research question into subquestions.
+decomposer.py — Fast Decomposer for research sub-questions.
 """
 
 from __future__ import annotations
@@ -18,20 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 DECOMPOSER_SYSTEM = """\
-You decompose a research question into 2-6 focused sub-questions.
-
-Guidelines:
-- Prefer FEWER, higher-signal subquestions.
-- Simple factual questions can have 1-2 subquestions.
-- Complex/controversial questions may have 4-6.
-- Include definitional, evidence-seeking, counter-evidence, and contextual
-  angles WHERE THEY GENUINELY APPLY.
-- Also classify overall complexity:
-    SIMPLE       — one authoritative source could answer
-    MODERATE     — needs a few good sources
-    COMPLEX      — research/causal, needs multiple independent sources
-    CONTROVERSIAL— actively seek disagreement
-Return the exact structured schema.
+Decompose the research question into 2-4 focused sub-questions.
+Complexity: SIMPLE | MODERATE | COMPLEX | CONTROVERSIAL.
+Keep purpose field under 6 words to optimize latency.
 """
 
 
@@ -40,28 +29,26 @@ class QuestionDecomposer:
         self.llm = llm or default_llm_client()
 
     def decompose(self, question: str) -> DecompositionResult:
-        user = (
-            f'Decompose this research question:\n\n"{question}"\n\n'
-            "Choose the minimum number of sub-questions that actually help."
-        )
+        user = f'Decompose: "{question}"'
         try:
             result = self.llm.structured_call(
                 system=DECOMPOSER_SYSTEM,
                 user=user,
                 response_model=DecompositionResult,
+                task_type="decomposition",
             )
         except (LLMError, LLMParseError) as e:
-            logger.warning("Decomposer LLM failed (%s) — using passthrough.", e)
+            logger.warning("Decomposer failed (%s) — using passthrough.", e)
             return DecompositionResult(
                 original_question=question,
                 sub_questions=[
                     SubQuestion(
                         id="Q1",
                         text=question,
-                        purpose="Direct restatement (decomposition unavailable).",
+                        purpose="Direct restatement.",
                     )
                 ],
-                reasoning="LLM unavailable; passthrough decomposition.",
+                reasoning="Passthrough.",
                 complexity=QuestionComplexity.MODERATE,
             )
 

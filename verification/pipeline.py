@@ -1,8 +1,8 @@
 """
 verification/pipeline.py — Wires the verification steps together.
 
-UPDATE: Creates task-specific ScheduledLLMClient instances so each
-M3 module routes to the optimal provider tier.
+Speed fix:
+- Reuses sub-questions if already provided (skips decomposer LLM call).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from .models import (
     QuestionComplexity,
     RawEvidence,
     ResearchGap,
+    SubQuestion,
     VerificationResult,
 )
 from .scheduler import (
@@ -74,9 +75,6 @@ class VerificationPipeline:
         self._scheduler = scheduler or get_default_scheduler()
         raw_llm = llm or default_llm_client()
 
-        # ★ Task-specific LLM clients for each M3 module
-        # Each client passes its task_type to the inner LLM (LLMGateway),
-        # which uses TaskRouter to select the optimal provider.
         self._decomp_llm = ScheduledLLMClient(
             inner=raw_llm, scheduler=self._scheduler,
             provider_name="m3-decomp", task_type="decomposition",
@@ -95,8 +93,6 @@ class VerificationPipeline:
         )
 
         self.max_rounds = max_rounds
-
-        # Each module uses its task-specific client
         self.decomposer = QuestionDecomposer(self._decomp_llm)
         self.analyzer = EvidenceAnalyzer(self._analyzer_llm)
         self.detector = ContradictionDetector(
@@ -105,8 +101,6 @@ class VerificationPipeline:
         )
         self.verifier = EvidenceVerifier(self._judge_llm)
         self.judge = ResearchJudge(self._judge_llm)
-
-        # Keep a reference for backward compatibility
         self.llm = self._judge_llm
 
     def run(
@@ -114,6 +108,7 @@ class VerificationPipeline:
         question: str,
         evidence: list[RawEvidence],
         complexity: QuestionComplexity | None = None,
+        sub_questions: list[str] | None = None,  # ★ Optional pre-planned subquestions
     ) -> PipelineResult:
         state = PipelineState(
             original_question=question,
@@ -122,9 +117,25 @@ class VerificationPipeline:
             complexity_override=complexity,
         )
         state.status = "decomposing"
-        state.decomposition = self.decomposer.decompose(question)
-        if complexity is not None:
-            state.decomposition.complexity = complexity
+
+        # ★ SPEED BOOST: If subquestions already planned by M1, reuse without LLM call!
+        if sub_questions and len(sub_questions) >= 2:
+            sq_objs = [
+                SubQuestion(id=f"Q{i+1}", text=sq, purpose="Planned inquiry")
+                for i, sq in enumerate(sub_questions)
+            ]
+            state.decomposition = DecompositionResult(
+                original_question=question,
+                sub_questions=sq_objs,
+                reasoning="Reused from M1 research plan.",
+                complexity=complexity or QuestionComplexity.MODERATE,
+            )
+            logger.info("⚡ Decomposer skipped: reused %d sub-questions from M1 plan", len(sq_objs))
+        else:
+            state.decomposition = self.decomposer.decompose(question)
+            if complexity is not None:
+                state.decomposition.complexity = complexity
+
         return self._analyze_verify_maybe_judge(state, evidence)
 
     def run_continue(
@@ -151,6 +162,7 @@ class VerificationPipeline:
         state.current_round += 1
         state.raw_evidence.extend(new_evidence)
         return self._analyze_verify_maybe_judge(state, new_evidence)
+
     def _analyze_verify_maybe_judge(
         self,
         state: PipelineState,

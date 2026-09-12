@@ -1,12 +1,11 @@
 """
-m1/gateway.py — Shared LLM Gateway with task-aware model routing and 4 Groq Keys.
+m1/gateway.py — Shared LLM Gateway with provider-specific schema normalization.
 
-Task routing:
-    - Fast tasks      → Groq (groq-1, groq-2, groq-3, groq-4)
-    - Reasoning      → Gemini
-    - Strong tasks    → HuggingFace/Qwen
-    - Automatic fallback on 429, timeout, unavailable model,
-      connection errors, and transient errors.
+Features:
+- Groq / OpenRouter: Strict JSON Schema with additionalProperties: False
+- Gemini: Inlined, dereferenced schema without $defs or additionalProperties
+- HuggingFace: Standard unconstrained JSON Schema
+- Fast failover on 400 schema error, 401/402/403, 404 model unavailable, 429, timeout
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from verification.scheduler import (
     is_rate_limit_error,
     is_timeout_error,
     is_connection_error,
+    is_permanent_error,
     _extract_retry_after,
 )
 
@@ -38,6 +38,13 @@ from .errors import (
     LLMPermanentError,
     LLMProviderError,
     LLMTransientError,
+)
+from .schema_utils import (
+    build_canonical_schema,
+    build_gemini_schema,
+    build_groq_schema,
+    build_huggingface_schema,
+    build_openrouter_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,67 +61,100 @@ _PERMANENT_TOKENS = (
     "invalid_api_key",
     "unauthorized",
     "401",
+    "402",
+    "payment required",
+    "payment_required",
     "forbidden",
     "403",
     "invalid_request",
     "billing",
     "insufficient_quota",
+    "insufficient credits",
     "permission denied",
+    "authentication",
+    "api key",
+    "additionalproperties",
+    "additional_properties",
+    "unknown name",
+    "unsupported parameter",
+    "unsupported_parameter",
+    "invalid parameter",
+    "extra inputs are not permitted",
 )
 
 _MODEL_UNAVAILABLE_TOKENS = (
-    "not found",
-    "404",
+    "model not found",
     "model_not_found",
-    "does not exist",
-    "not supported",
-    "unknown model",
     "model unavailable",
     "model is not available",
+    "does not exist",
+    "unknown model",
+    "not supported",
+    "unsupported model",
+    "404",
 )
 
 
-def _error_message(err: Exception) -> str:
-    return str(err).lower()
+def _error_message(error: Exception) -> str:
+    return str(error).lower()
 
 
-def _classify(err: Exception) -> LLMProviderError:
-    """
-    Convert arbitrary provider exceptions into project-level errors.
-    """
-    if isinstance(err, LLMProviderError):
-        return err
+def _classify(error: Exception) -> LLMProviderError:
+    """Convert arbitrary exceptions into project-level errors."""
+    if isinstance(error, LLMProviderError):
+        return error
 
-    message = _error_message(err)
+    if type(error).__name__ in ("PermanentLLMError", "LLMPermanentError"):
+        return LLMPermanentError(str(error))
+
+    message = _error_message(error)
+    status_code = getattr(error, "status_code", None)
+
+    if status_code in (400, 401, 402, 403, 404):
+        return LLMPermanentError(str(error))
 
     if any(token in message for token in _PERMANENT_TOKENS):
-        return LLMPermanentError(str(err))
+        return LLMPermanentError(str(error))
 
-    return LLMTransientError(str(err))
+    if any(token in message for token in _MODEL_UNAVAILABLE_TOKENS):
+        return LLMPermanentError(str(error))
+
+    return LLMTransientError(str(error))
 
 
-def _is_model_unavailable(err: Exception) -> bool:
-    """
-    Detect errors indicating that selected model is unavailable.
-    """
-    message = _error_message(err)
-    return any(
-        token in message
-        for token in _MODEL_UNAVAILABLE_TOKENS
+def _is_model_unavailable(error: Exception) -> bool:
+    message = _error_message(error)
+    return any(token in message for token in _MODEL_UNAVAILABLE_TOKENS)
+
+
+def _is_unsupported_parameter(error: Exception) -> bool:
+    message = _error_message(error)
+    tokens = (
+        "unsupported parameter",
+        "unsupported_parameter",
+        "unknown parameter",
+        "unrecognized request argument",
+        "temperature is not supported",
+        "temperature not supported",
+        "response_format is not supported",
+        "json_schema is not supported",
+        "extra inputs are not permitted",
+        "invalid parameter",
     )
+    return any(token in message for token in tokens)
 
 
 def _get_timeout_for_task(task_type: str) -> float:
-    """Select the exact configured timeout limit for a specific task safely."""
     if task_type in ("query_generation", "decomposition", "search_planning", "classification"):
         return getattr(CONFIG, "TIMEOUT_QUERY_GENERATION", 30.0)
-    elif task_type in ("evidence_analysis", "evidence_extraction"):
+    if task_type in ("evidence_analysis", "evidence_extraction"):
         return getattr(CONFIG, "TIMEOUT_EVIDENCE_ANALYSIS", 45.0)
-    elif task_type in ("contradiction_detection", "contradiction_pairs"):
+    if task_type in ("contradiction_detection", "contradiction_pairs"):
         return getattr(CONFIG, "TIMEOUT_CONTRADICTION_PAIRS", 45.0)
-    elif task_type in ("final_verdict", "final_synthesis"):
+    if task_type in ("final_verdict", "final_synthesis"):
         return getattr(CONFIG, "TIMEOUT_FINAL_VERDICT", 90.0)
     return getattr(CONFIG, "LLM_TIMEOUT", 30.0)
+
 
 # ============================================================
 # Provider Interface
@@ -122,6 +162,7 @@ def _get_timeout_for_task(task_type: str) -> float:
 
 class _Provider:
     name: str = "base"
+    model: str = "unknown"
 
     def structured(
         self,
@@ -142,34 +183,76 @@ class _Provider:
 
 
 # ============================================================
-# Groq Provider
+# OpenAI-Compatible Base Provider
 # ============================================================
 
-class _GroqProvider(_Provider):
-    """
-    OpenAI-compatible Groq provider.
-    """
-
+class _OpenAICompatibleProvider(_Provider):
     def __init__(
         self,
         api_key: str,
-        label: str,
+        base_url: str,
         model: str,
+        label: str,
         timeout: float,
+        default_headers: Optional[dict[str, str]] = None,
+        schema_builder: Optional[Callable[[Type[BaseModel]], dict[str, Any]]] = None,
     ):
         from openai import OpenAI
 
         self.name = label
-        self._model = model
+        self.model = model
         self._default_timeout = timeout
+        self._schema_builder = schema_builder or build_canonical_schema
 
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=CONFIG.GROQ_BASE_URL,
-            timeout=timeout,
-            max_retries=0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": timeout,
+            "max_retries": 0,
+        }
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
 
+        self._client = OpenAI(**client_kwargs)
+
+    def _create_completion(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        timeout: float,
+        response_format: Optional[dict[str, Any]] = None,
+        include_temperature: bool = True,
+    ):
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "timeout": timeout,
+        }
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        if include_temperature:
+            kwargs["temperature"] = CONFIG.LLM_TEMPERATURE
+
+        try:
+            return self._client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if include_temperature and _is_unsupported_parameter(error):
+                logger.debug(
+                    "[%s] Request parameter unsupported; retrying without temperature: %s",
+                    self.name,
+                    error,
+                )
+                kwargs.pop("temperature", None)
+                return self._client.chat.completions.create(**kwargs)
+            raise
+
+    @staticmethod
+    def _extract_content(completion: Any) -> str:
+        try:
+            content = completion.choices[0].message.content
+        except Exception as error:
+            raise LLMTransientError(f"Invalid completion response: {error}") from error
+        return (content or "").strip()
     def structured(
         self,
         system: str,
@@ -177,78 +260,91 @@ class _GroqProvider(_Provider):
         model: Type[T],
         timeout: Optional[float] = None,
     ) -> T:
-        t = timeout if timeout is not None else self._default_timeout
-        try:
-            completion = self._client.beta.chat.completions.parse(
-                model=self._model,
-                temperature=CONFIG.LLM_TEMPERATURE,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system,
-                    },
-                    {
-                        "role": "user",
-                        "content": user,
-                    },
-                ],
-                response_format=model,
-                timeout=t,
-            )
+        t = (
+            timeout
+            if timeout is not None
+            else self._default_timeout
+        )
 
-            parsed = getattr(
-                completion.choices[0].message,
-                "parsed",
-                None,
-            )
-
-            if parsed is not None:
-                return parsed
-
-        except Exception as error:
-            logger.debug(
-                "[%s] Native structured output failed: %s",
-                self.name,
-                error,
-            )
+        provider_schema = self._schema_builder(model)
 
         schema_hint = (
             "\n\nRespond with ONLY valid JSON matching this schema:\n"
-            f"{json.dumps(model.model_json_schema(), indent=2)}"
+            f"{json.dumps(provider_schema, indent=2)}"
         )
+        messages = [
+            {"role": "system", "content": system + schema_hint},
+            {"role": "user", "content": user},
+        ]
 
-        completion = self._client.chat.completions.create(
-            model=self._model,
-            temperature=CONFIG.LLM_TEMPERATURE,
-            response_format={
-                "type": "json_object",
-            },
-            messages=[
-                {
-                    "role": "system",
-                    "content": system + schema_hint,
+        # ----------------------------------------------------
+        # Attempt 1: Strict JSON Schema
+        # ----------------------------------------------------
+        try:
+            completion = self._create_completion(
+                messages=messages,
+                timeout=t,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": model.__name__,
+                        "strict": True,
+                        "schema": provider_schema,
+                    },
                 },
-                {
-                    "role": "user",
-                    "content": user,
-                },
-            ],
-            timeout=t,
-        )
-
-        content = (
-            completion.choices[0].message.content or ""
-        ).strip()
-
-        if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty structured response"
             )
+            content = self._extract_content(completion)
+            if content:
+                return model.model_validate_json(content)
+        except Exception as error:
+            logger.debug("[%s] Strict JSON schema failed (%s) → trying json_object mode", self.name, error)
+            # ★ FIX: If it's a rate limit, timeout, or connection error, raise to failover.
+            # But if it's a schema/400 issue, DON'T raise — try Attempt 2 (json_object) on same provider!
+            if (
+                _is_model_unavailable(error)
+                or is_connection_error(error)
+                or is_timeout_error(error)
+                or is_rate_limit_error(error)
+            ):
+                raise
+
+        # ----------------------------------------------------
+        # Attempt 2: JSON Object Mode (Groq supports this 100%)
+        # ----------------------------------------------------
+        try:
+            completion = self._create_completion(
+                messages=messages,
+                timeout=t,
+                response_format={"type": "json_object"},
+            )
+            content = self._extract_content(completion)
+            if content:
+                return model.model_validate_json(content)
+        except Exception as error:
+            logger.debug("[%s] JSON object mode failed: %s", self.name, error)
+            if (
+                _is_model_unavailable(error)
+                or is_connection_error(error)
+                or is_timeout_error(error)
+                or is_rate_limit_error(error)
+            ):
+                raise
+
+        # ----------------------------------------------------
+        # Attempt 3: Plain completion with JSON prompt
+        # ----------------------------------------------------
+        completion = self._create_completion(
+            messages=messages,
+            timeout=t,
+            response_format=None,
+        )
+        content = self._extract_content(completion)
+        if not content:
+            raise LLMTransientError(f"{self.name}: empty structured response")
 
         try:
             payload = json.loads(content)
             return model.model_validate(payload)
-
         except Exception as error:
             raise LLMTransientError(
                 f"{self.name}: invalid structured JSON: {error}"
@@ -261,61 +357,91 @@ class _GroqProvider(_Provider):
         timeout: Optional[float] = None,
     ) -> str:
         t = timeout if timeout is not None else self._default_timeout
-        completion = self._client.chat.completions.create(
-            model=self._model,
-            temperature=CONFIG.LLM_TEMPERATURE,
+        completion = self._create_completion(
             messages=[
-                {
-                    "role": "system",
-                    "content": system,
-                },
-                {
-                    "role": "user",
-                    "content": user,
-                },
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             timeout=t,
+            response_format=None,
         )
-
-        content = (
-            completion.choices[0].message.content or ""
-        ).strip()
-
+        content = self._extract_content(completion)
         if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty text response"
-            )
-
+            raise LLMTransientError(f"{self.name}: empty text response")
         return content
 
 
 # ============================================================
-# Gemini Provider
+# Groq
+# ============================================================
+
+class _GroqProvider(_OpenAICompatibleProvider):
+    def __init__(self, api_key: str, label: str, model: str, timeout: float):
+        super().__init__(
+            api_key=api_key,
+            base_url=getattr(CONFIG, "GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+            model=model,
+            label=label,
+            timeout=timeout,
+            schema_builder=build_groq_schema,  # ★ Strict additionalProperties: False
+        )
+
+
+# ============================================================
+# OpenRouter
+# ============================================================
+
+class _OpenRouterProvider(_OpenAICompatibleProvider):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        timeout: float,
+        site_url: str = "",
+        app_name: str = "",
+    ):
+        if not model.endswith(":free"):
+            logger.warning(
+                "OpenRouter model '%s' does not end with ':free'. "
+                "Set OPENROUTER_MODEL to a free variant to avoid billing.",
+                model,
+            )
+
+        headers: dict[str, str] = {}
+        if site_url:
+            headers["HTTP-Referer"] = site_url
+        if app_name:
+            headers["X-Title"] = app_name
+
+        super().__init__(
+            api_key=api_key,
+            base_url=getattr(CONFIG, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            model=model,
+            label="openrouter",
+            timeout=timeout,
+            default_headers=headers or None,
+            schema_builder=build_openrouter_schema,  # ★ Strict additionalProperties: False
+        )
+
+
+# ============================================================
+# Gemini (google-genai SDK)
 # ============================================================
 
 class _GeminiProvider(_Provider):
     """
-    Google Gemini provider using the currently installed
-    google-generativeai compatibility package.
+    Google Gemini provider using google-genai SDK.
+    Uses build_gemini_schema to remove $defs, $schema, and additionalProperties.
     """
 
-    def __init__(
-        self,
-        api_key: str,
-        model_name: str,
-        timeout: float,
-    ):
-        import google.generativeai as genai
+    def __init__(self, api_key: str, model_name: str, timeout: float):
+        from google import genai
 
-        self._model_name = model_name
         self.name = f"gemini({model_name})"
+        self.model = model_name
         self._default_timeout = timeout
 
-        genai.configure(api_key=api_key)
-
-        self._model = genai.GenerativeModel(
-            model_name=model_name,
-        )
+        self._client = genai.Client(api_key=api_key)
 
     def structured(
         self,
@@ -324,36 +450,28 @@ class _GeminiProvider(_Provider):
         model: Type[T],
         timeout: Optional[float] = None,
     ) -> T:
-        t = timeout if timeout is not None else self._default_timeout
-        schema_hint = (
-            "\n\nRespond with ONLY valid JSON matching this schema:\n"
-            f"{json.dumps(model.model_json_schema(), indent=2)}"
+        from google.genai import types
+
+        # ★ Provider-specific Gemini schema: cleaned, inlined, no $defs or additionalProperties
+        gemini_schema = build_gemini_schema(model)
+
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=f"{system}\n\nUSER:\n{user}",
+            config=types.GenerateContentConfig(
+                temperature=CONFIG.LLM_TEMPERATURE,
+                response_mime_type="application/json",
+                response_schema=gemini_schema,
+            ),
         )
 
-        response = self._model.generate_content(
-            f"{system}\n"
-            f"{schema_hint}\n\n"
-            f"USER:\n{user}",
-            generation_config={
-                "response_mime_type": "application/json",
-                "temperature": CONFIG.LLM_TEMPERATURE,
-            },
-            request_options={"timeout": t},
-        )
-
-        content = (
-            getattr(response, "text", "") or ""
-        ).strip()
-
+        content = (getattr(response, "text", "") or "").strip()
         if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty structured response"
-            )
+            raise LLMTransientError(f"{self.name}: empty structured response")
 
         try:
             payload = json.loads(content)
             return model.model_validate(payload)
-
         except Exception as error:
             raise LLMTransientError(
                 f"{self.name}: invalid structured JSON: {error}"
@@ -365,33 +483,21 @@ class _GeminiProvider(_Provider):
         user: str,
         timeout: Optional[float] = None,
     ) -> str:
-        t = timeout if timeout is not None else self._default_timeout
-        response = self._model.generate_content(
-            f"{system}\n\nUSER:\n{user}",
-            request_options={"timeout": t},
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=f"{system}\n\nUSER:\n{user}",
         )
-
-        content = (
-            getattr(response, "text", "") or ""
-        ).strip()
-
+        content = (getattr(response, "text", "") or "").strip()
         if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty text response"
-            )
-
+            raise LLMTransientError(f"{self.name}: empty text response")
         return content
 
 
 # ============================================================
-# HuggingFace Provider
+# HuggingFace Router
 # ============================================================
 
 class _HuggingFaceProvider(_Provider):
-    """
-    OpenAI-compatible HuggingFace Router provider.
-    """
-
     def __init__(
         self,
         token: str,
@@ -405,43 +511,26 @@ class _HuggingFaceProvider(_Provider):
         self._OpenAI = OpenAI
         self._token = token
         self._default_timeout = timeout
-
         self._base_url = self._normalize_base_url(base_url)
-
         self._primary = primary_model
         self._fallback = fallback_model
-
         self._current = primary_model
         self._switched = False
-
         self._client = self._make_client()
         self.name = f"hf({self._current})"
-
-        logger.info(
-            "HF endpoint normalized to: %s",
-            self._base_url,
-        )
+        self.model = self._current
 
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         url = (base_url or "").strip().rstrip("/")
-
         if not url:
             return "https://router.huggingface.co/v1"
-
         if "api-inference.huggingface.co" in url:
-            logger.warning(
-                "Deprecated HuggingFace endpoint detected. "
-                "Switching to router.huggingface.co/v1"
-            )
             return "https://router.huggingface.co/v1"
-
         if url == "https://router.huggingface.co":
             return "https://router.huggingface.co/v1"
-
         if not url.endswith("/v1"):
             url = f"{url}/v1"
-
         return url
 
     def _make_client(self):
@@ -453,23 +542,14 @@ class _HuggingFaceProvider(_Provider):
         )
 
     def _try_switch(self) -> bool:
-        if self._switched:
+        if self._switched or not self._fallback:
             return False
-
-        if not self._fallback:
-            return False
-
-        logger.warning(
-            "HF model '%s' unavailable → switching to '%s'",
-            self._current,
-            self._fallback,
-        )
-
+        logger.warning("HF model '%s' unavailable → switching to '%s'", self._current, self._fallback)
         self._current = self._fallback
         self._client = self._make_client()
         self.name = f"hf({self._current})"
+        self.model = self._current
         self._switched = True
-
         return True
 
     def _do_structured(
@@ -479,71 +559,19 @@ class _HuggingFaceProvider(_Provider):
         model: Type[T],
         timeout: Optional[float] = None,
     ) -> T:
-        t = timeout if timeout is not None else self._default_timeout
-        schema_hint = (
-            "\n\nRespond with ONLY valid JSON matching this schema:\n"
-            f"{json.dumps(model.model_json_schema(), indent=2)}"
+        provider = _OpenAICompatibleProvider.__new__(_OpenAICompatibleProvider)
+        provider.name = self.name
+        provider.model = self._current
+        provider._default_timeout = self._default_timeout
+        provider._client = self._client
+        provider._schema_builder = build_huggingface_schema
+
+        return provider.structured(
+            system=system,
+            user=user,
+            model=model,
+            timeout=timeout,
         )
-
-        messages = [
-            {
-                "role": "system",
-                "content": system + schema_hint,
-            },
-            {
-                "role": "user",
-                "content": user,
-            },
-        ]
-
-        try:
-            completion = self._client.chat.completions.create(
-                model=self._current,
-                temperature=CONFIG.LLM_TEMPERATURE,
-                response_format={
-                    "type": "json_object",
-                },
-                messages=messages,
-                timeout=t,
-            )
-
-        except Exception as first_error:
-            if is_connection_error(first_error):
-                raise
-
-            if is_timeout_error(first_error):
-                raise
-
-            logger.debug(
-                "[%s] JSON response_format failed: %s",
-                self.name,
-                first_error,
-            )
-
-            completion = self._client.chat.completions.create(
-                model=self._current,
-                temperature=CONFIG.LLM_TEMPERATURE,
-                messages=messages,
-                timeout=t,
-            )
-
-        content = (
-            completion.choices[0].message.content or ""
-        ).strip()
-
-        if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty structured response"
-            )
-
-        try:
-            payload = json.loads(content)
-            return model.model_validate(payload)
-
-        except Exception as error:
-            raise LLMTransientError(
-                f"{self.name}: invalid structured JSON: {error}"
-            ) from error
 
     def structured(
         self,
@@ -553,25 +581,10 @@ class _HuggingFaceProvider(_Provider):
         timeout: Optional[float] = None,
     ) -> T:
         try:
-            return self._do_structured(
-                system,
-                user,
-                model,
-                timeout=timeout,
-            )
-
+            return self._do_structured(system, user, model, timeout=timeout)
         except Exception as error:
-            if (
-                _is_model_unavailable(error)
-                and self._try_switch()
-            ):
-                return self._do_structured(
-                    system,
-                    user,
-                    model,
-                    timeout=timeout,
-                )
-
+            if _is_model_unavailable(error) and self._try_switch():
+                return self._do_structured(system, user, model, timeout=timeout)
             raise
 
     def _do_text(
@@ -581,31 +594,28 @@ class _HuggingFaceProvider(_Provider):
         timeout: Optional[float] = None,
     ) -> str:
         t = timeout if timeout is not None else self._default_timeout
-        completion = self._client.chat.completions.create(
-            model=self._current,
-            temperature=CONFIG.LLM_TEMPERATURE,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system,
-                },
-                {
-                    "role": "user",
-                    "content": user,
-                },
-            ],
-            timeout=t,
-        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        kwargs: dict[str, Any] = {
+            "model": self._current,
+            "messages": messages,
+            "timeout": t,
+            "temperature": CONFIG.LLM_TEMPERATURE,
+        }
+        try:
+            completion = self._client.chat.completions.create(**kwargs)
+        except Exception as error:
+            if _is_unsupported_parameter(error):
+                kwargs.pop("temperature", None)
+                completion = self._client.chat.completions.create(**kwargs)
+            else:
+                raise
 
-        content = (
-            completion.choices[0].message.content or ""
-        ).strip()
-
+        content = (completion.choices[0].message.content or "").strip()
         if not content:
-            raise LLMTransientError(
-                f"{self.name}: empty text response"
-            )
-
+            raise LLMTransientError(f"{self.name}: empty text response")
         return content
 
     def text(
@@ -615,23 +625,10 @@ class _HuggingFaceProvider(_Provider):
         timeout: Optional[float] = None,
     ) -> str:
         try:
-            return self._do_text(
-                system,
-                user,
-                timeout=timeout,
-            )
-
+            return self._do_text(system, user, timeout=timeout)
         except Exception as error:
-            if (
-                _is_model_unavailable(error)
-                and self._try_switch()
-            ):
-                return self._do_text(
-                    system,
-                    user,
-                    timeout=timeout,
-                )
-
+            if _is_model_unavailable(error) and self._try_switch():
+                return self._do_text(system, user, timeout=timeout)
             raise
 
 
@@ -641,7 +638,7 @@ class _HuggingFaceProvider(_Provider):
 
 class LLMGateway:
     """
-    Central LLM gateway with task-aware provider routing.
+    Central gateway for all LLM requests with provider-specific schema normalization.
     """
 
     def __init__(
@@ -659,26 +656,17 @@ class LLMGateway:
         self.base_delay = base_delay
         self._sleep = sleep_fn
 
-        self._scheduler = (
-            scheduler
-            or get_default_scheduler()
-        )
-
-        self._task_router = (
-            task_router
-            or get_default_task_router()
-        )
+        self._scheduler = scheduler or get_default_scheduler()
+        self._task_router = task_router or get_default_task_router()
+        self._last_call_metadata: dict[str, Any] = {}
 
         self._build_provider_chain()
 
         if not self._providers:
-            logger.warning(
-                "No LLM providers configured."
-            )
+            logger.warning("No LLM providers configured.")
 
-    # --------------------------------------------------------
-    # Provider Chain (UPDATED FOR 4 GROQ KEYS)
-    # --------------------------------------------------------
+    def get_last_call_metadata(self) -> dict:
+        return dict(self._last_call_metadata)
 
     def _build_provider_chain(self) -> None:
         def add_provider(provider: _Provider) -> None:
@@ -686,82 +674,77 @@ class LLMGateway:
             self._provider_map[provider.name] = provider
 
         groq_slots = [
-            (CONFIG.GROQ_API_KEY_1, "groq-1"),
-            (CONFIG.GROQ_API_KEY_2, "groq-2"),
-            (CONFIG.GROQ_API_KEY_3, "groq-3"),
-            (CONFIG.GROQ_API_KEY_4, "groq-4"),
+            (getattr(CONFIG, "GROQ_API_KEY_1", ""), "groq-1"),
+            (getattr(CONFIG, "GROQ_API_KEY_2", ""), "groq-2"),
+            (getattr(CONFIG, "GROQ_API_KEY_3", ""), "groq-3"),
+            (getattr(CONFIG, "GROQ_API_KEY_4", ""), "groq-4"),
         ]
 
         for api_key, label in groq_slots:
-            if api_key:
-                try:
-                    add_provider(
-                        _GroqProvider(
-                            api_key=api_key,
-                            label=label,
-                            model=CONFIG.GROQ_MODEL,
-                            timeout=CONFIG.LLM_TIMEOUT,
-                        )
+            if not api_key:
+                continue
+            try:
+                add_provider(
+                    _GroqProvider(
+                        api_key=api_key,
+                        label=label,
+                        model=CONFIG.GROQ_MODEL,
+                        timeout=CONFIG.LLM_TIMEOUT,
                     )
-                except Exception as error:
-                    logger.warning(
-                        "Failed to initialize %s: %s",
-                        label,
-                        error,
-                    )
+                )
+            except Exception as error:
+                logger.warning("Failed to initialize %s: %s", label, error)
 
-        # Gemini
-        if CONFIG.GEMINI_API_KEY:
+        gemini_key = getattr(CONFIG, "GEMINI_API_KEY", "")
+        if gemini_key:
             try:
                 add_provider(
                     _GeminiProvider(
-                        api_key=CONFIG.GEMINI_API_KEY,
+                        api_key=gemini_key,
                         model_name=CONFIG.GEMINI_MODEL,
                         timeout=CONFIG.LLM_TIMEOUT,
                     )
                 )
             except Exception as error:
-                logger.warning(
-                    "Failed to initialize Gemini: %s",
-                    error,
-                )
+                logger.warning("Failed to initialize Gemini: %s", error)
 
-        # HuggingFace
-        if CONFIG.HF_TOKEN:
+        openrouter_key = getattr(CONFIG, "OPENROUTER_API_KEY", "")
+        if openrouter_key:
+            try:
+                add_provider(
+                    _OpenRouterProvider(
+                        api_key=openrouter_key,
+                        model=CONFIG.OPENROUTER_MODEL,
+                        timeout=CONFIG.LLM_TIMEOUT,
+                        site_url=getattr(CONFIG, "OPENROUTER_SITE_URL", ""),
+                        app_name=getattr(CONFIG, "OPENROUTER_APP_NAME", ""),
+                    )
+                )
+            except Exception as error:
+                logger.warning("Failed to initialize OpenRouter: %s", error)
+
+        hf_token = getattr(CONFIG, "HF_TOKEN", "")
+        if hf_token:
             try:
                 add_provider(
                     _HuggingFaceProvider(
-                        token=CONFIG.HF_TOKEN,
+                        token=hf_token,
                         primary_model=CONFIG.HF_MODEL,
-                        fallback_model=CONFIG.HF_MODEL_FALLBACK,
+                        fallback_model=getattr(CONFIG, "HF_MODEL_FALLBACK", None),
                         base_url=CONFIG.HF_BASE_URL,
                         timeout=CONFIG.LLM_TIMEOUT,
                     )
                 )
             except Exception as error:
-                logger.warning(
-                    "Failed to initialize HuggingFace: %s",
-                    error,
-                )
-
-        provider_names = [
-            provider.name
-            for provider in self._providers
-        ]
+                logger.warning("Failed to initialize HuggingFace: %s", error)
 
         logger.info(
             "Provider chain: %s",
-            " → ".join(provider_names)
-            if provider_names
-            else "(none)",
+            " → ".join(p.name for p in self._providers) if self._providers else "(none)",
         )
 
     def has_providers(self) -> bool:
         return bool(self._providers)
-
-    # --------------------------------------------------------
-    # Public M3 / LLMClient Protocol
-    # --------------------------------------------------------
 
     def structured_call(
         self,
@@ -770,20 +753,17 @@ class LLMGateway:
         response_model: Type[T],
         **kwargs: Any,
     ) -> T:
-        task_type = kwargs.get(
-            "task_type",
-            "default",
-        )
-
+        task_type = kwargs.get("task_type", "default")
         return self._call_with_fallback(
-            fn=lambda provider, t_out: provider.structured(
-                system,
-                user,
-                response_model,
-                timeout=t_out,
+            fn=lambda provider, timeout: provider.structured(
+                system=system,
+                user=user,
+                model=response_model,
+                timeout=timeout,
             ),
             label=f"structured<{response_model.__name__}>",
             task_type=task_type,
+            operation="structured",
         )
 
     def text_call(
@@ -792,55 +772,48 @@ class LLMGateway:
         user: str,
         **kwargs: Any,
     ) -> str:
-        task_type = kwargs.get(
-            "task_type",
-            "default",
-        )
-
+        task_type = kwargs.get("task_type", "default")
         return self._call_with_fallback(
-            fn=lambda provider, t_out: provider.text(
-                system,
-                user,
-                timeout=t_out,
+            fn=lambda provider, timeout: provider.text(
+                system=system,
+                user=user,
+                timeout=timeout,
             ),
             label="text_call",
             task_type=task_type,
+            operation="text",
         )
-
-    # --------------------------------------------------------
-    # Task-Aware Fallback Execution
-    # --------------------------------------------------------
 
     def _call_with_fallback(
         self,
         fn: Callable[[_Provider, float], Any],
         label: str,
         task_type: str = "default",
+        operation: str = "structured",
     ) -> Any:
         if not self._providers:
-            raise LLMPermanentError(
-                "No LLM providers configured"
-            )
+            raise LLMPermanentError("No LLM providers configured")
 
-        # Match exact timeout config based on task type
         task_timeout = _get_timeout_for_task(task_type)
 
-        available_names = [
-            provider.name
-            for provider in self._providers
-        ]
+        available_names = [p.name for p in self._providers]
+        cooled = {n for n in available_names if self._scheduler.is_in_cooldown(n)}
 
-        cooled = {
-            name
-            for name in available_names
-            if self._scheduler.is_in_cooldown(name)
-        }
-
-        ordered_names = self._task_router.select_providers(
+        routed_names = self._task_router.select_providers(
             task_type,
             available_names,
             cooled_down_providers=cooled,
         )
+
+        ordered_names: list[str] = []
+        for name in routed_names:
+            if name in self._provider_map and name not in ordered_names:
+                ordered_names.append(name)
+        for name in available_names:
+            if name not in ordered_names and name not in cooled:
+                ordered_names.append(name)
+        if not ordered_names:
+            ordered_names = list(routed_names)
 
         ordered_providers = [
             self._provider_map[name]
@@ -849,179 +822,153 @@ class LLMGateway:
         ]
 
         last_error: Optional[Exception] = None
-        is_first_provider = True
+        provider_attempt_number = 0
+        first_provider_tried: Optional[str] = None
 
         for provider in ordered_providers:
             if self._scheduler.is_in_cooldown(provider.name):
-                remaining = (
-                    self._scheduler.get_cooldown_remaining(
-                        provider.name
-                    )
-                )
-
-                logger.info(
-                    "⏭️ Skip '%s' (cooldown %.1fs)",
-                    provider.name,
-                    remaining,
-                )
-                is_first_provider = False
+                remaining = self._scheduler.get_cooldown_remaining(provider.name)
+                logger.info("⏭️ Skip '%s' (cooldown %.1fs)", provider.name, remaining)
                 continue
 
+            provider_attempt_number += 1
+            is_fallback = provider_attempt_number > 1
+            provider_model = getattr(provider, "model", "unknown-model")
+
+            if first_provider_tried is None:
+                first_provider_tried = provider.name
+
             logger.info(
-                "Trying provider '%s' for task='%s'",
-                provider.name,
+                "[LLM] task=%s provider=%s model=%s attempt=%d",
                 task_type,
+                provider.name,
+                provider_model,
+                provider_attempt_number,
             )
 
-            for attempt in range(
-                1,
-                self.max_retries + 2,
-            ):
+            for retry_attempt in range(1, self.max_retries + 2):
+                started_at = time.time()
                 try:
                     result = self._scheduler.execute(
                         fn=lambda p=provider: fn(p, task_timeout),
                         provider_name=provider.name,
-                        request_label=(
-                            f"{task_type}:{label}"
-                        ),
+                        request_label=f"{task_type}:{label}",
                     )
+
+                    latency_ms = int((time.time() - started_at) * 1000)
+
+                    self._last_call_metadata = {
+                        "provider": provider.name,
+                        "model": provider_model,
+                        "task_type": task_type,
+                        "operation": operation,
+                        "status": "success",
+                        "error": None,
+                        "attempt": provider_attempt_number,
+                        "retry_attempt": retry_attempt,
+                        "latency_ms": latency_ms,
+                        "fallback_used": is_fallback,
+                        "fallback_from": first_provider_tried if is_fallback else None,
+                        "timestamp": time.time(),
+                    }
 
                     self._task_router.record_call(
                         task_type,
                         provider.name,
-                        was_fallback=not is_first_provider,
+                        was_fallback=is_fallback,
                     )
 
                     return result
 
                 except Exception as raw_error:
+                    latency_ms = int((time.time() - started_at) * 1000)
                     err = _classify(raw_error)
                     last_error = err
 
-                    # ----------------------------------------
-                    # Rate limit: immediately move provider
-                    # ----------------------------------------
-                    if is_rate_limit_error(raw_error):
-                        retry_after = _extract_retry_after(
-                            raw_error
-                        )
+                    self._last_call_metadata = {
+                        "provider": provider.name,
+                        "model": provider_model,
+                        "task_type": task_type,
+                        "operation": operation,
+                        "status": "failed",
+                        "error": str(raw_error),
+                        "attempt": provider_attempt_number,
+                        "retry_attempt": retry_attempt,
+                        "latency_ms": latency_ms,
+                        "fallback_used": is_fallback,
+                        "fallback_from": first_provider_tried if is_fallback else None,
+                        "timestamp": time.time(),
+                    }
 
-                        cooldown = (
-                            retry_after
-                            or self._scheduler.cooldown_seconds
-                        )
-
-                        self._scheduler.set_cooldown(
-                            provider.name,
-                            cooldown,
-                        )
-
-                        self._task_router.record_cooldown(
-                            provider.name
-                        )
-
-                        logger.warning(
-                            "🚫 429 from '%s'. Cooldown %.1fs "
-                            "→ next provider.",
-                            provider.name,
-                            cooldown,
-                        )
-                        break
-
-                    # ----------------------------------------
-                    # Connection error: no repeated retry
-                    # ----------------------------------------
-                    if is_connection_error(raw_error):
-                        logger.warning(
-                            "🌐 Connection failure on '%s': %s "
-                            "→ next provider immediately",
-                            provider.name,
-                            raw_error,
-                        )
-                        break
-
-                    # ----------------------------------------
-                    # Timeout: immediately failover
-                    # ----------------------------------------
-                    if is_timeout_error(raw_error):
-                        # Apply local 15-second soft cooldown to prevent immediately hammering it
-                        self._scheduler.set_cooldown(provider.name, 15.0)
-                        logger.warning(
-                            "⏱️ Timeout on '%s' for task='%s'. "
-                            "Switching to next provider.",
-                            provider.name,
-                            task_type,
-                        )
-                        break
-
-                    # ----------------------------------------
-                    # Permanent provider error
-                    # ----------------------------------------
+                    # ★ Fast failover on permanent error (400 schema error, 401/402/403/404)
                     if isinstance(err, LLMPermanentError):
+                        self._scheduler.set_cooldown(provider.name, 3600.0)
                         logger.warning(
-                            "Permanent error on '%s': %s",
+                            "🚫 Permanent error on '%s': %s → failing over to next provider",
                             provider.name,
                             err,
                         )
                         break
 
-                    # ----------------------------------------
-                    # Model unavailable
-                    # ----------------------------------------
-                    if _is_model_unavailable(raw_error):
+                    if is_rate_limit_error(raw_error):
+                        retry_after = _extract_retry_after(raw_error)
+                        cooldown = retry_after or self._scheduler.cooldown_seconds
+                        self._scheduler.set_cooldown(provider.name, cooldown)
+                        self._task_router.record_cooldown(provider.name)
                         logger.warning(
-                            "Model unavailable on '%s': %s "
-                            "→ next provider",
+                            "🚫 Rate limit from '%s'. Cooldown %.1fs → next provider.",
+                            provider.name,
+                            cooldown,
+                        )
+                        break
+
+                    if is_connection_error(raw_error):
+                        logger.warning(
+                            "🌐 Connection failure on '%s': %s → next provider",
                             provider.name,
                             raw_error,
                         )
                         break
 
-                    # ----------------------------------------
-                    # Normal transient retry
-                    # ----------------------------------------
-                    if attempt > self.max_retries:
+                    if is_timeout_error(raw_error):
+                        self._scheduler.set_cooldown(provider.name, 15.0)
                         logger.warning(
-                            "'%s' retries exhausted",
+                            "⏱️ Timeout on '%s' task='%s' → next provider",
                             provider.name,
+                            task_type,
                         )
                         break
 
-                    delay = (
-                        self.base_delay
-                        * (2 ** (attempt - 1))
-                    )
+                    if _is_model_unavailable(raw_error):
+                        logger.warning(
+                            "Model unavailable on '%s': %s → next provider",
+                            provider.name,
+                            raw_error,
+                        )
+                        break
 
-                    delay *= 1 + random.uniform(
-                        -0.1,
-                        0.1,
-                    )
+                    if retry_attempt > self.max_retries:
+                        logger.warning("'%s' retries exhausted", provider.name)
+                        break
 
-                    self._sleep(
-                        max(0.5, delay)
-                    )
+                    delay = self.base_delay * (2 ** (retry_attempt - 1))
+                    delay *= 1 + random.uniform(-0.1, 0.1)
+                    self._sleep(max(0.5, delay))
 
             is_first_provider = False
 
-        raise last_error or LLMProviderError(
-            "All providers failed or are in cooldown"
-        )
+        raise last_error or LLMProviderError("All providers failed or are in cooldown")
 
 
 # ============================================================
-# Optional Convenience Singleton
+# Singleton
 # ============================================================
 
 _default_gateway: Optional[LLMGateway] = None
 
 
 def get_default_gateway() -> LLMGateway:
-    """
-    Return a lazily initialized shared gateway instance.
-    """
     global _default_gateway
-
     if _default_gateway is None:
         _default_gateway = LLMGateway()
-
     return _default_gateway

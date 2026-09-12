@@ -24,7 +24,7 @@ class _FakeM3:
     def __init__(self):
         self.calls = 0
 
-    def run(self, question, evidence, complexity=None):
+    def run(self, question, evidence, complexity=None, **kwargs):
         self.calls += 1
         class R:
             verdict = _V()
@@ -35,7 +35,7 @@ class _FakeM3:
             max_rounds_reached = False
         return R()
 
-    def run_continue(self, state, new_evidence, complexity=None):
+    def run_continue(self, state, new_evidence, complexity=None, **kwargs):
         return self.run("", new_evidence)
 
 
