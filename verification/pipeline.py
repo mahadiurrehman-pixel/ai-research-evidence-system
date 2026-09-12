@@ -151,14 +151,16 @@ class VerificationPipeline:
         state.current_round += 1
         state.raw_evidence.extend(new_evidence)
         return self._analyze_verify_maybe_judge(state, new_evidence)
-
     def _analyze_verify_maybe_judge(
         self,
         state: PipelineState,
         evidence_to_analyze: list[RawEvidence],
     ) -> PipelineResult:
+        import time as _time
         assert state.decomposition is not None
 
+        # ── ANALYZE ──
+        t0 = _time.time()
         state.status = "analyzing"
         new_analyzed = self.analyzer.analyze(
             sub_questions=state.decomposition.sub_questions,
@@ -166,13 +168,20 @@ class VerificationPipeline:
             original_question=state.original_question,
         )
         state.analyzed_evidence.extend(new_analyzed)
+        logger.info("⏱️ M3 Stage [Analyze]: %.2fs (%d items)", _time.time() - t0, len(new_analyzed))
 
+        # ── CONTRADICTION ──
+        t1 = _time.time()
         state.status = "checking"
         state.contradictions = self.detector.detect(
             state.analyzed_evidence,
             raw_evidence=state.raw_evidence,
         )
+        logger.info("⏱️ M3 Stage [Contradiction]: %.2fs (%d pairs)",
+                     _time.time() - t1, len(state.contradictions.contradiction_pairs))
 
+        # ── VERIFY ──
+        t2 = _time.time()
         effective_complexity = (
             state.complexity_override
             if state.complexity_override is not None
@@ -186,6 +195,7 @@ class VerificationPipeline:
             max_research_rounds=self.max_rounds,
             current_round=state.current_round,
         )
+        logger.info("⏱️ M3 Stage [Verify]: %.2fs", _time.time() - t2)
 
         return self._finalize(state)
 

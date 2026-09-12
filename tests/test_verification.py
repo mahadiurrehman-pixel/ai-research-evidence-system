@@ -61,7 +61,8 @@ class FakeLLM:
         self.fail = fail
         self.calls = []
 
-    def structured_call(self, system, user, response_model):
+    # ★ FIX: Added **kwargs to structured_call and text_call to accept task_type safely
+    def structured_call(self, system, user, response_model, **kwargs):
         self.calls.append((response_model.__name__, user))
         if self.fail:
             raise LLMError("simulated failure")
@@ -73,7 +74,7 @@ class FakeLLM:
             return obj
         return response_model.model_validate(obj)
 
-    def text_call(self, system, user):
+    def text_call(self, system, user, **kwargs):
         if self.fail:
             raise LLMError("simulated failure")
         return "OK"
@@ -664,9 +665,7 @@ def test_cal_full_pipeline_regression():
     assert "no contradictory evidence exists" not in r.verdict.detailed_reasoning.lower()
 
 
-# ═════════════════════════════════════════════
-# SECOND-PASS REGRESSION TESTS
-# ═════════════════════════════════════════════
+# ── SECOND-PASS REGRESSION TESTS ─────────────
 
 def test_sp_a_stanford_positive_oxford_negative_contradiction():
     """Stanford positive + Oxford negative -> contradiction detected."""
@@ -925,6 +924,12 @@ def test_sp_f_full_pipeline_non_null_with_real_structure():
             classification=ContradictionClass.CONTRADICTORY,
             context_difference="teens vs adults",
         ),
+        "VerificationResult": lambda u: VerificationResult(
+            is_sufficient=True, confidence=Confidence.HIGH,
+            evidence_count=3, supporting_count=1,
+            contradicting_count=2, neutral_count=0,
+            source_quality="Good", reasoning="2 strong RCTs",
+        ),
         "FinalVerdict": lambda u: FinalVerdict(
             original_question="Test?",
             verdict=VerdictType.PARTIALLY_SUPPORTED,
@@ -1127,9 +1132,11 @@ def test_sp2_positive_vs_null_not_automatic_contradiction():
     assert r.has_contradictions is False
     assert r.contradiction_pairs[0].classification == ContradictionClass.CONTEXT_DIFFERENCE
 
+
 # ═════════════════════════════════════════════
 # DYNAMIC FAILOVER INTEGRATION TESTS
 # ═════════════════════════════════════════════
+
 def test_sp3_hf_timeout_failover_without_multiple_retries():
     """
     Verify that a timeout on HuggingFace immediately switches to Gemini/Groq
