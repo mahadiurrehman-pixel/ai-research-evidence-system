@@ -32,12 +32,12 @@ function stagesForStatus(status: string): PipelineStage[] {
   }));
 }
 
-export default function InvestigationPage({
+export default async function InvestigationPage({
   params,
 }: {
-  params: { id: string };
+  params: Promise<{ id: string }>;
 }) {
-  const { id } = params;
+  const { id } = await params;
   const [inv, setInv] = useState<Investigation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
