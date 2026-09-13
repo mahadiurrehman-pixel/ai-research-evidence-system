@@ -36,10 +36,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_origins=[
         "http://localhost:3000",
         "https://ai-research-evidence-system.vercel.app",
-        "https://ai-research-evidence-system-lr9m5r8ts-vertex-ai4.vercel.app",
     ],
     allow_credentials=False,
     allow_methods=["*"],
