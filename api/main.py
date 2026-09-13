@@ -39,6 +39,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://ai-research-evidence-system.vercel.app",
+        "https://ai-research-evidence-system-lr9m5r8ts-vertex-ai4.vercel.app",
     ],
     allow_credentials=False,
     allow_methods=["*"],
