@@ -106,7 +106,7 @@ function InvestigateContent() {
   }, [initialQuery]);
 
   return (
-    <div className="max-w-[1400px] mx-auto px-6 py-8">
+    <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-8 sm:py-10">
       <div className="mb-8">
         <ClaimComposer onSubmit={handleInvestigate} loading={loading} />
       </div>
@@ -129,7 +129,7 @@ function InvestigateContent() {
           {/* Left Sidebar — Pipeline Status */}
           <div className="lg:sticky lg:top-20 lg:self-start">
             <div className="p-4 rounded-2xl glass-surface">
-              <h3 className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-4">
+              <h3 className="text-xs font-semibold text-accent-dark tracking-[0.12em] uppercase mb-4">
                 Investigation Pipeline
               </h3>
               <EvidenceTimeline stages={stages} />
@@ -175,7 +175,7 @@ function InvestigateContent() {
                   </div>
                 </div>
                 
-                <div className="p-5 font-mono text-xs text-slate-400 h-[400px] overflow-y-auto space-y-2">
+                <div className="p-4 sm:p-5 font-mono text-xs text-slate-400 h-[400px] overflow-y-auto space-y-2">
                   {liveLogs.map((log, i) => (
                     <div key={i} className="flex gap-3 items-start animate-slide-up" style={{ animationDuration: "0.2s" }}>
                       <span className="text-ink-600 select-none">{String(i + 1).padStart(2, '0')}</span>

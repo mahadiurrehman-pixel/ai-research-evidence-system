@@ -45,7 +45,7 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
   return (
     <div className="w-full max-w-3xl mx-auto">
       {/* Mode selector */}
-      <div className="flex items-center gap-2 mb-4">
+      <div className="flex items-center gap-1.5 mb-4 overflow-x-auto pb-1">
         {modes.map((mode) => {
           const Icon = mode.icon;
           return (
@@ -53,7 +53,7 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
               key={mode.id}
               onClick={() => setSelectedMode(mode.id)}
               className={cn(
-                "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200",
+                "flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 whitespace-nowrap",
                 selectedMode === mode.id
                   ? "bg-accent/10 text-accent border border-accent/20"
                   : "text-slate-500 hover:text-surface-200 hover:bg-ink-800/40 border border-transparent"
@@ -71,13 +71,13 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
         <div
           className={cn(
             "relative rounded-2xl border transition-all duration-300",
-            "bg-ink-850/80 backdrop-blur-sm",
+            "bg-ink-850/95 shadow-card",
             query
               ? "border-accent/30 shadow-glow"
               : "border-ink-700/20 hover:border-ink-600/30"
           )}
         >
-          <div className="flex items-start p-4">
+          <div className="flex items-start p-4 sm:p-5">
             <Search
               className={cn(
                 "w-5 h-5 mt-0.5 mr-3 flex-shrink-0 transition-colors",
@@ -96,13 +96,13 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
               }}
               placeholder="Investigate a claim, compare evidence, or verify a statement…"
               rows={2}
-              className="flex-1 bg-transparent text-surface-100 placeholder:text-slate-600 text-sm leading-relaxed resize-none focus:outline-none"
+              className="flex-1 min-w-0 bg-transparent text-surface-100 placeholder:text-slate-500 text-sm leading-relaxed resize-none focus:outline-none"
             />
           </div>
 
           {/* Bottom bar */}
-          <div className="flex items-center justify-between px-4 pb-3">
-            <div className="flex items-center gap-2 text-2xs text-slate-600">
+          <div className="flex items-center justify-between gap-3 px-4 sm:px-5 pb-4">
+            <div className="hidden sm:flex items-center gap-2 text-2xs text-slate-500">
               <kbd className="px-1.5 py-0.5 rounded bg-ink-800 border border-ink-700/30 font-mono">
                 <Command className="w-2.5 h-2.5 inline" />
               </kbd>
@@ -128,8 +128,8 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
       </div>
 
       {/* Suggestions */}
-      <div className="mt-6 flex flex-wrap gap-2">
-        <span className="text-2xs text-slate-600 uppercase tracking-wider mr-1 self-center">
+      <div className="mt-5 flex flex-wrap gap-2">
+        <span className="text-2xs text-slate-500 font-medium mr-1 self-center">
           Try:
         </span>
         {suggestions.map((s) => (

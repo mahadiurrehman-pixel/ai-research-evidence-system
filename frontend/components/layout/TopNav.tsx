@@ -6,11 +6,13 @@ import {
   Settings,
   Bell,
   Search,
-  ChevronDown,
+  Menu,
+  X,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { useState } from "react";
 
 const navItems = [
   { href: "/", label: "Dashboard" },
@@ -20,10 +22,11 @@ const navItems = [
 
 export function TopNav() {
   const pathname = usePathname();
+  const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <header className="fixed top-0 left-0 right-0 z-50 h-14 glass border-b border-ink-700/15">
-      <div className="h-full max-w-[1600px] mx-auto px-6 flex items-center justify-between">
+    <header className="fixed top-0 left-0 right-0 z-50 min-h-16 glass border-b border-ink-700/70">
+      <div className="min-h-16 max-w-[1600px] mx-auto px-4 sm:px-6 flex items-center justify-between gap-4">
         {/* Left */}
         <div className="flex items-center gap-8">
           <Link href="/">
@@ -36,10 +39,10 @@ export function TopNav() {
                 key={item.href}
                 href={item.href}
                 className={cn(
-                  "px-3 py-1.5 rounded-lg text-sm transition-all duration-200",
+                  "px-3 py-2 rounded-lg text-sm transition-all duration-200",
                   pathname === item.href
-                    ? "text-surface-100 bg-ink-800/60"
-                    : "text-slate-500 hover:text-surface-200 hover:bg-ink-800/30"
+                    ? "text-accent-dark bg-accent/10"
+                    : "text-slate-400 hover:text-surface-100 hover:bg-ink-800/70"
                 )}
               >
                 {item.label}
@@ -50,24 +53,48 @@ export function TopNav() {
 
         {/* Right */}
         <div className="flex items-center gap-3">
-          <Badge variant="accent" size="sm">
+          <Badge variant="accent" size="sm" className="hidden sm:inline-flex">
             <span className="w-1.5 h-1.5 rounded-full bg-accent mr-1.5 animate-pulse-slow" />
             System Online
           </Badge>
 
-          <button className="p-2 rounded-lg text-slate-500 hover:text-surface-200 hover:bg-ink-800/40 transition-colors">
+          <button aria-label="Search" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
             <Search className="w-4 h-4" />
           </button>
 
-          <button className="p-2 rounded-lg text-slate-500 hover:text-surface-200 hover:bg-ink-800/40 transition-colors">
+          <button aria-label="Notifications" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
             <Bell className="w-4 h-4" />
           </button>
 
-          <button className="p-2 rounded-lg text-slate-500 hover:text-surface-200 hover:bg-ink-800/40 transition-colors">
+          <button aria-label="Settings" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
             <Settings className="w-4 h-4" />
+          </button>
+          <button
+            aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+            onClick={() => setMenuOpen(!menuOpen)}
+            className="md:hidden p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors"
+          >
+            {menuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
           </button>
         </div>
       </div>
+      {menuOpen && (
+        <nav className="md:hidden border-t border-ink-700/70 bg-ink-900 px-4 py-3 space-y-1">
+          {navItems.map((item) => (
+            <Link
+              key={item.href}
+              href={item.href}
+              onClick={() => setMenuOpen(false)}
+              className={cn(
+                "block px-3 py-2.5 rounded-lg text-sm",
+                pathname === item.href ? "text-accent-dark bg-accent/10" : "text-slate-400 hover:bg-ink-800/70"
+              )}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+      )}
     </header>
   );
 }

@@ -35,25 +35,24 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="min-h-[calc(100vh-3.5rem)] flex flex-col">
+    <div className="min-h-[calc(100vh-4rem)] flex flex-col">
       {/* Hero area */}
-      <div className="flex-1 flex flex-col items-center justify-center px-6 py-16">
-        <div className="text-center mb-10 animate-fade-in">
-          <div className="inline-flex items-center gap-2 mb-6">
-            <Sparkles className="w-4 h-4 text-accent" />
-            <span className="text-xs font-medium text-accent tracking-wide uppercase">
-              Evidence Intelligence Platform
+      <div className="flex-1 flex flex-col items-center justify-center px-4 sm:px-6 py-14 sm:py-20">
+        <div className="w-full max-w-4xl text-center mb-10 animate-fade-in">
+          <div className="inline-flex items-center gap-2 mb-5 px-3 py-1.5 rounded-full border border-accent/20 bg-accent/5">
+            <span className="w-1.5 h-1.5 rounded-full bg-accent" />
+            <span className="text-xs font-medium text-accent-dark tracking-wide">
+              Research, made legible
             </span>
           </div>
 
-          <h1 className="text-4xl md:text-5xl font-bold tracking-tight text-surface-100 mb-3">
-            Verify what's{" "}
-            <span className="accent-gradient">actually true</span>
+          <h1 className="font-display text-4xl sm:text-5xl md:text-6xl font-semibold tracking-tight text-surface-100 mb-5 leading-[1.05]">
+            Turn difficult claims into{" "}
+            <span className="accent-gradient">clear evidence.</span>
           </h1>
 
-          <p className="text-base text-slate-500 max-w-lg mx-auto leading-relaxed">
-            Investigate claims against real research evidence. Get calibrated
-            verdicts backed by peer-reviewed sources, meta-analyses, and RCTs.
+          <p className="text-base sm:text-lg text-slate-400 max-w-2xl mx-auto leading-relaxed">
+            Investigate claims against peer-reviewed research, compare what the evidence says, and leave with a verdict you can explain.
           </p>
         </div>
 
@@ -64,13 +63,13 @@ export default function DashboardPage() {
 
       {/* Stats bar */}
       <div className="border-t border-ink-700/15 bg-ink-900/40">
-        <div className="max-w-[1200px] mx-auto px-6 py-6">
+        <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
             {stats.map((stat) => {
               const Icon = stat.icon;
               return (
                 <div key={stat.label} className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-ink-800/60 border border-ink-700/20">
+                  <div className="p-2 rounded-lg bg-accent/8 border border-accent/15">
                     <Icon className="w-4 h-4 text-accent" />
                   </div>
                   <div>
@@ -88,7 +87,7 @@ export default function DashboardPage() {
 
       {/* Recent investigations */}
       <div className="border-t border-ink-700/15 bg-ink-950">
-        <div className="max-w-[1200px] mx-auto px-6 py-8">
+        <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-8">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-medium text-surface-200">
               Recent Investigations
@@ -106,7 +105,7 @@ export default function DashboardPage() {
               <Link
                 key={inv.investigation_id}
                 href={`/investigation/${inv.investigation_id}`}
-                className="flex items-center justify-between p-3 rounded-xl hover:bg-ink-800/30 border border-transparent hover:border-ink-700/15 transition-all duration-200 group"
+                className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-3 rounded-xl hover:bg-ink-800/70 border border-transparent hover:border-ink-700 transition-all duration-200 group"
               >
                 <div className="flex items-center gap-3 min-w-0">
                   <Shield className="w-4 h-4 text-slate-600 group-hover:text-accent transition-colors flex-shrink-0" />
@@ -115,7 +114,7 @@ export default function DashboardPage() {
                   </span>
                 </div>
 
-                <div className="flex items-center gap-3 ml-4 flex-shrink-0">
+                <div className="flex items-center gap-3 sm:ml-4 pl-7 sm:pl-0 flex-shrink-0">
                   {inv.verdict && (
                     <Badge
                       variant={

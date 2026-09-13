@@ -14,10 +14,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en">
       <body className="min-h-screen">
         <TopNav />
-        <main className="pt-14">{children}</main>
+        <main className="pt-16">{children}</main>
       </body>
     </html>
   );

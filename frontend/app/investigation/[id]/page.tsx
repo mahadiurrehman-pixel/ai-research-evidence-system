@@ -26,9 +26,9 @@ export default function InvestigationPage({
   const inv = mockInvestigation;
 
   return (
-    <div className="max-w-[1400px] mx-auto px-6 py-8">
+    <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-8 sm:py-10">
       {/* Header */}
-      <div className="flex items-start justify-between mb-8">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-5 mb-8">
         <div className="flex items-start gap-4">
           <Link
             href="/history"
@@ -47,13 +47,13 @@ export default function InvestigationPage({
                 </Badge>
               )}
             </div>
-            <h1 className="text-lg font-semibold text-surface-100 tracking-tight max-w-2xl">
+            <h1 className="font-display text-xl sm:text-2xl font-semibold text-surface-100 tracking-tight max-w-2xl leading-tight">
               {inv.question}
             </h1>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 pl-12 sm:pl-0">
           <Button variant="ghost" size="sm">
             <Share2 className="w-3.5 h-3.5" />
             Share
@@ -69,7 +69,7 @@ export default function InvestigationPage({
         {/* Left — Pipeline */}
         <div className="lg:sticky lg:top-20 lg:self-start">
           <div className="p-4 rounded-2xl glass-surface">
-            <h3 className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-4">
+            <h3 className="text-xs font-semibold text-accent-dark tracking-[0.12em] uppercase mb-4">
               Pipeline
             </h3>
             <EvidenceTimeline stages={mockPipelineStages} />
@@ -90,7 +90,7 @@ export default function InvestigationPage({
         {/* Right — Metadata */}
         <div className="lg:sticky lg:top-20 lg:self-start space-y-4">
           <div className="p-4 rounded-2xl glass-surface space-y-4">
-            <h3 className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+            <h3 className="text-xs font-semibold text-accent-dark tracking-[0.12em] uppercase">
               Metadata
             </h3>
 
@@ -117,7 +117,7 @@ export default function InvestigationPage({
           </div>
 
           <div className="p-4 rounded-2xl glass-surface space-y-3">
-            <h3 className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+            <h3 className="text-xs font-semibold text-accent-dark tracking-[0.12em] uppercase">
               Statistics
             </h3>
             <div className="flex items-center gap-2 text-sm text-slate-400">

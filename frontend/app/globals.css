@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500&display=swap");
 
 @layer base {
   * {
@@ -10,12 +10,14 @@
   }
 
   body {
-    @apply bg-ink-950 text-surface-200 antialiased;
+    @apply bg-ink-950 text-surface-100 antialiased;
+    background-image: radial-gradient(rgba(15, 118, 110, 0.08) 0.7px, transparent 0.7px);
+    background-size: 22px 22px;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 
   ::selection {
-    @apply bg-accent/20 text-accent-light;
+    @apply bg-accent/20 text-accent-dark;
   }
 
   ::-webkit-scrollbar {
@@ -38,26 +40,26 @@
 
 @layer components {
   .glass {
-    @apply bg-ink-900/80 backdrop-blur-xl border border-ink-700/20;
+    @apply bg-ink-900/90 backdrop-blur-xl border border-ink-700/70;
   }
 
   .glass-surface {
-    @apply bg-ink-850/60 backdrop-blur-md border border-ink-700/15;
+    @apply bg-ink-850/90 backdrop-blur-md border border-ink-700/70;
   }
 
   .text-gradient {
-    @apply bg-gradient-to-r from-surface-100 to-surface-300 bg-clip-text text-transparent;
+    @apply text-surface-100;
   }
 
   .accent-gradient {
-    @apply bg-gradient-to-r from-accent to-accent-light bg-clip-text text-transparent;
+    @apply text-accent;
   }
 
   .border-subtle {
-    @apply border-ink-700/20;
+    @apply border-ink-700/70;
   }
 
   .focus-ring {
-    @apply focus:outline-none focus:ring-1 focus:ring-accent/40 focus:ring-offset-1 focus:ring-offset-ink-950;
+    @apply focus:outline-none focus:ring-2 focus:ring-accent/30 focus:ring-offset-2 focus:ring-offset-ink-950;
   }
 }

@@ -62,7 +62,7 @@ export function VerdictDisplay({
           )}
         />
 
-        <div className="flex items-start gap-5">
+        <div className="flex flex-col sm:flex-row items-start gap-4 sm:gap-5">
           <div
             className={cn(
               "p-3 rounded-xl",
@@ -79,7 +79,7 @@ export function VerdictDisplay({
           </div>
 
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-3 mb-2">
+            <div className="flex flex-wrap items-center gap-3 mb-2">
               <h2
                 className={cn(
                   "text-xl font-semibold tracking-tight",
@@ -106,7 +106,7 @@ export function VerdictDisplay({
             </p>
 
             {/* Stats row */}
-            <div className="flex items-center gap-6 mt-4 text-xs text-slate-500">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4 text-xs text-slate-500">
               <span>
                 <strong className="text-surface-200">{evidenceCount}</strong>{" "}
                 sources analyzed
@@ -127,7 +127,9 @@ export function VerdictDisplay({
             </div>
           </div>
 
-          <ConfidenceMeter percent={confPercent} size={72} />
+          <div className="sm:ml-auto">
+            <ConfidenceMeter percent={confPercent} size={72} />
+          </div>
         </div>
       </div>
 
