@@ -106,6 +106,17 @@ class EvidenceAnalyzer:
             return [self._safe_neutral_stub(ev, [sub_questions[0].id]) for ev in evidence]
 
         item_map = {item.source_id: item for item in batch_result.items}
+        expected_ids = {ev.source_id for ev in evidence}
+        returned_ids = [item.source_id for item in batch_result.items]
+        missing_ids = expected_ids - set(returned_ids)
+        unknown_ids = set(returned_ids) - expected_ids
+        duplicate_count = len(returned_ids) - len(set(returned_ids))
+        if missing_ids or unknown_ids or duplicate_count:
+            self._record_incomplete_metric()
+            logger.error(
+                "Incomplete Analyze response: expected=%d returned=%d missing=%d unknown=%d duplicates=%d; fallback records are explicitly marked",
+                len(expected_ids), len(returned_ids), len(missing_ids), len(unknown_ids), duplicate_count,
+            )
         out: list[AnalyzedEvidence] = []
         
         for ev in evidence:
@@ -127,6 +138,11 @@ class EvidenceAnalyzer:
                 out.append(self._safe_neutral_stub(ev, [sub_questions[0].id]))
 
         return out
+
+    def _record_incomplete_metric(self) -> None:
+        recorder = getattr(self.llm, "record_metric", None)
+        if callable(recorder):
+            recorder("incomplete_analysis_count")
 
     def _safe_neutral_stub(self, ev: RawEvidence, q_ids: list[str]) -> AnalyzedEvidence:
         return AnalyzedEvidence(

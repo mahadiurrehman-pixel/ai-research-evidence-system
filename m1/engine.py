@@ -374,12 +374,19 @@ class InvestigationEngine:
     ) -> InvestigationResult:
         elapsed = time.time() - start_time
 
+        meaningful_evidence = bool(
+            getattr(state, "evidence_collected", 0) > 0
+            or getattr(state, "raw_evidence", None)
+        )
+
         if override_status is not None:
             status = override_status
         elif verdict is not None:
             status = InvestigationStatus.COMPLETED
-        elif state.errors:
+        elif state.errors and not meaningful_evidence:
             status = InvestigationStatus.FAILED
+        elif state.errors:
+            status = InvestigationStatus.INCONCLUSIVE
         else:
             status = InvestigationStatus.INCONCLUSIVE
 

@@ -10,6 +10,7 @@ from m1.engine import InvestigationEngine
 from m1.models import (
     InvestigationLevel,
     InvestigationRequest,
+    InvestigationState,
     InvestigationStatus,
     QuestionComplexity,
     ResearchIntent,
@@ -215,3 +216,54 @@ def test_m2_empty_response_handled():
     r = engine.run(InvestigationRequest(question="Does A improve B"))
     assert r.status in (InvestigationStatus.INCONCLUSIVE, InvestigationStatus.FAILED)
     assert r.evidence_count == 0
+
+
+def test_provider_error_after_evidence_does_not_fail_investigation():
+    state = InvestigationState(
+        question="Does A improve B",
+        evidence_collected=3,
+        raw_evidence=[object(), object(), object()],
+        errors=["Groq quota exhausted"],
+    )
+
+    engine = InvestigationEngine(
+        m2_search_fn=_mock_m2_search,
+        m3_pipeline=_FakeM3Pipeline([]),
+        gateway=_FakeGateway(),
+    )
+
+    result = engine._finalize(
+        state=state,
+        start_time=0,
+        verdict=None,
+        route_meta=None,
+    )
+
+    assert result.status == InvestigationStatus.INCONCLUSIVE
+    assert result.evidence_count >= 1
+    assert result.errors == ["Groq quota exhausted"]
+
+
+def test_completed_verdict_survives_provider_error():
+    state = InvestigationState(
+        question="Does A improve B",
+        evidence_collected=3,
+        raw_evidence=[object(), object(), object()],
+        errors=["Groq quota exhausted"],
+    )
+
+    engine = InvestigationEngine(
+        m2_search_fn=_mock_m2_search,
+        m3_pipeline=_FakeM3Pipeline([]),
+        gateway=_FakeGateway(),
+    )
+
+    result = engine._finalize(
+        state=state,
+        start_time=0,
+        verdict=_FakeVerdict(),
+        route_meta=None,
+    )
+
+    assert result.status == InvestigationStatus.COMPLETED
+    assert result.verdict is not None

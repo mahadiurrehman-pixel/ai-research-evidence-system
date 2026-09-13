@@ -50,6 +50,7 @@ class PipelineState:
     current_round: int = 1
     status: str = "idle"
     complexity_override: Optional[QuestionComplexity] = None
+    stage_latencies: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -180,7 +181,8 @@ class VerificationPipeline:
             original_question=state.original_question,
         )
         state.analyzed_evidence.extend(new_analyzed)
-        logger.info("⏱️ M3 Stage [Analyze]: %.2fs (%d items)", _time.time() - t0, len(new_analyzed))
+        state.stage_latencies["analyze"] = _time.time() - t0
+        logger.info("⏱️ M3 Stage [Analyze]: %.2fs (%d items)", state.stage_latencies["analyze"], len(new_analyzed))
 
         # ── CONTRADICTION ──
         t1 = _time.time()
@@ -189,8 +191,9 @@ class VerificationPipeline:
             state.analyzed_evidence,
             raw_evidence=state.raw_evidence,
         )
+        state.stage_latencies["contradiction"] = _time.time() - t1
         logger.info("⏱️ M3 Stage [Contradiction]: %.2fs (%d pairs)",
-                     _time.time() - t1, len(state.contradictions.contradiction_pairs))
+                 state.stage_latencies["contradiction"], len(state.contradictions.contradiction_pairs))
 
         # ── VERIFY ──
         t2 = _time.time()
@@ -207,7 +210,8 @@ class VerificationPipeline:
             max_research_rounds=self.max_rounds,
             current_round=state.current_round,
         )
-        logger.info("⏱️ M3 Stage [Verify]: %.2fs", _time.time() - t2)
+        state.stage_latencies["verify"] = _time.time() - t2
+        logger.info("⏱️ M3 Stage [Verify]: %.2fs", state.stage_latencies["verify"])
 
         return self._finalize(state)
 
@@ -233,6 +237,14 @@ class VerificationPipeline:
                 raw_evidence=state.raw_evidence,
             )
             state.status = "done"
+            analyzer_metrics = self._analyzer_llm.get_metrics()
+            analysis_complete = analyzer_metrics.get("incomplete_analysis_count", 0) == 0
+            logger.info(
+                "M3 investigation outcome=COMPLETED verdict=%s analysis_complete=%s stages=%s",
+                state.final_verdict.verdict.value,
+                analysis_complete,
+                {name: round(value, 3) for name, value in state.stage_latencies.items()},
+            )
             return PipelineResult(
                 verdict=state.final_verdict,
                 needs_more_research=False,
@@ -243,6 +255,10 @@ class VerificationPipeline:
             )
 
         state.status = "needs_more"
+        logger.info(
+            "M3 investigation outcome=INCOMPLETE stages=%s",
+            {name: round(value, 3) for name, value in state.stage_latencies.items()},
+        )
         return PipelineResult(
             verdict=None,
             needs_more_research=True,

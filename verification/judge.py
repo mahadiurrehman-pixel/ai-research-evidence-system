@@ -229,10 +229,11 @@ class ResearchJudge:
     ) -> str:
         ev_lines = []
         for e in analyzed_evidence:
+            claim = " ".join(e.key_claim.split())[:160]
             ev_lines.append(
                 f"  [{e.source_id}] {e.support_level.value} | "
                 f"Quality: {e.strength.value}\n"
-                f"    Claim: {e.key_claim}"
+                f"    Claim: {claim}"
             )
         ev_summary = "\n".join(ev_lines) or "  (none)"
 

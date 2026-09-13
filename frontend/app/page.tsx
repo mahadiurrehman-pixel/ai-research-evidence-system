@@ -2,33 +2,29 @@
 
 import { ClaimComposer } from "@/components/investigate/ClaimComposer";
 import { Badge } from "@/components/ui/Badge";
-import { mockHistory } from "@/lib/mock-data";
+import { getHistory } from "@/lib/api";
+import type { Investigation } from "@/lib/types";
 import {
-  getVerdictColor,
   getVerdictLabel,
   timeAgo,
 } from "@/lib/utils";
-import {
-  Activity,
-  BookOpen,
-  FileSearch,
-  Shield,
-  Sparkles,
-  TrendingUp,
-  Zap,
-} from "lucide-react";
+import { FileSearch, Shield } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-
-const stats = [
-  { label: "Investigations", value: "247", icon: FileSearch },
-  { label: "Sources Analyzed", value: "4.2K", icon: BookOpen },
-  { label: "Avg. Speed", value: "19s", icon: Zap },
-  { label: "Accuracy", value: "94%", icon: TrendingUp },
-];
+import { useEffect, useState } from "react";
 
 export default function DashboardPage() {
   const router = useRouter();
+  const [history, setHistory] = useState<Investigation[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getHistory()
+      .then(setHistory)
+      .catch((err) => setHistoryError(err instanceof Error ? err.message : "Unable to load history."))
+      .finally(() => setHistoryLoading(false));
+  }, []);
 
   const handleInvestigate = (question: string) => {
     router.push(`/investigate?q=${encodeURIComponent(question)}`);
@@ -61,37 +57,11 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Stats bar */}
-      <div className="border-t border-ink-700/15 bg-ink-900/40">
-        <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-            {stats.map((stat) => {
-              const Icon = stat.icon;
-              return (
-                <div key={stat.label} className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-accent/8 border border-accent/15">
-                    <Icon className="w-4 h-4 text-accent" />
-                  </div>
-                  <div>
-                    <div className="text-lg font-semibold text-surface-100">
-                      {stat.value}
-                    </div>
-                    <div className="text-2xs text-slate-600">{stat.label}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </div>
-
       {/* Recent investigations */}
       <div className="border-t border-ink-700/15 bg-ink-950">
         <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-8">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-medium text-surface-200">
-              Recent Investigations
-            </h2>
+            <h2 className="text-sm font-medium text-surface-200">Recent investigations</h2>
             <Link
               href="/history"
               className="text-xs text-slate-500 hover:text-accent transition-colors"
@@ -100,8 +70,17 @@ export default function DashboardPage() {
             </Link>
           </div>
 
+          {historyLoading && <p className="text-sm text-slate-500">Loading your research history...</p>}
+          {historyError && <p className="text-sm text-verdict-contradicted">{historyError}</p>}
+          {!historyLoading && !historyError && history.length === 0 && (
+            <div className="rounded-xl border border-dashed border-ink-700 px-4 py-8 text-center">
+              <FileSearch className="mx-auto mb-3 h-5 w-5 text-slate-500" />
+              <p className="text-sm text-surface-200">No investigations yet.</p>
+              <p className="mt-1 text-xs text-slate-500">Start with a claim above to build your research trail.</p>
+            </div>
+          )}
           <div className="space-y-2">
-            {mockHistory.map((inv) => (
+            {history.slice(0, 5).map((inv) => (
               <Link
                 key={inv.investigation_id}
                 href={`/investigation/${inv.investigation_id}`}

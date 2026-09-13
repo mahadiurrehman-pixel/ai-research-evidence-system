@@ -1,29 +1,67 @@
 "use client";
 
-import { use } from "react";
 import { VerdictDisplay } from "@/components/verdict/VerdictDisplay";
 import { EvidenceTimeline } from "@/components/verdict/EvidenceTimeline";
 import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
-import { mockInvestigation, mockPipelineStages } from "@/lib/mock-data";
+import { getInvestigation } from "@/lib/api";
+import type { Investigation, PipelineStage } from "@/lib/types";
 import {
   ArrowLeft,
   Clock,
   FileSearch,
+  AlertCircle,
   Activity,
-  Share2,
-  Download,
-  BookOpen,
 } from "lucide-react";
 import Link from "next/link";
+import { useEffect, useState } from "react";
+
+const stageLabels = [
+  ["routing", "Claim analysis"],
+  ["planning", "Research planning"],
+  ["searching", "Evidence retrieval"],
+  ["verifying", "Analysis and verification"],
+  ["verdict", "Final result"],
+] as const;
+
+function stagesForStatus(status: string): PipelineStage[] {
+  const statusIndex = { CREATED: 0, ROUTING: 0, PLANNING: 1, SEARCHING: 2, VERIFYING: 3, COMPLETED: 5, INCONCLUSIVE: 5, FAILED: 5 }[status] ?? 0;
+  return stageLabels.map(([id, label], index) => ({
+    id,
+    label,
+    status: status === "FAILED" && index === statusIndex ? "error" : index < statusIndex ? "complete" : index === statusIndex ? "active" : "pending",
+  }));
+}
 
 export default function InvestigationPage({
   params,
 }: {
-  params: Promise<{ id: string }>;
+  params: { id: string };
 }) {
-  const { id } = use(params);
-  const inv = mockInvestigation;
+  const { id } = params;
+  const [inv, setInv] = useState<Investigation | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getInvestigation(id)
+      .then(setInv)
+      .catch((err) => setError(err instanceof Error ? err.message : "Unable to load this investigation."))
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  if (loading) {
+    return <div className="mx-auto max-w-3xl px-4 py-16 text-center text-sm text-slate-500">Loading investigation...</div>;
+  }
+
+  if (error || !inv) {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-16 text-center">
+        <AlertCircle className="mx-auto mb-3 h-6 w-6 text-verdict-contradicted" />
+        <p className="text-sm text-verdict-contradicted">{error || "Investigation not found."}</p>
+        <Link href="/history" className="mt-4 inline-block text-sm text-accent hover:text-accent-light">Back to history</Link>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-8 sm:py-10">
@@ -53,16 +91,6 @@ export default function InvestigationPage({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 pl-12 sm:pl-0">
-          <Button variant="ghost" size="sm">
-            <Share2 className="w-3.5 h-3.5" />
-            Share
-          </Button>
-          <Button variant="secondary" size="sm">
-            <Download className="w-3.5 h-3.5" />
-            Export
-          </Button>
-        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr_260px] gap-6">
@@ -72,7 +100,7 @@ export default function InvestigationPage({
             <h3 className="text-xs font-semibold text-accent-dark tracking-[0.12em] uppercase mb-4">
               Pipeline
             </h3>
-            <EvidenceTimeline stages={mockPipelineStages} />
+            <EvidenceTimeline stages={stagesForStatus(inv.status)} />
           </div>
         </div>
 
@@ -84,6 +112,15 @@ export default function InvestigationPage({
               evidenceCount={inv.evidence_count}
               timeTaken={inv.time_taken}
             />
+          )}
+          {!inv.verdict && (
+            <div className="rounded-2xl border border-dashed border-ink-700 bg-ink-850/70 p-8 text-center">
+              <AlertCircle className="mx-auto mb-3 h-6 w-6 text-verdict-partial" />
+              <h2 className="text-lg font-semibold text-surface-100">No final verdict returned</h2>
+              <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-slate-500">
+                This investigation finished as {inv.status.toLowerCase().replaceAll("_", " ")}. The API returned {inv.evidence_count} analyzed source{inv.evidence_count === 1 ? "" : "s"}, but no conclusion was available.
+              </p>
+            </div>
           )}
         </div>
 
@@ -131,10 +168,6 @@ export default function InvestigationPage({
             <div className="flex items-center gap-2 text-sm text-slate-400">
               <Clock className="w-4 h-4 text-accent" />
               {inv.time_taken}
-            </div>
-            <div className="flex items-center gap-2 text-sm text-slate-400">
-              <BookOpen className="w-4 h-4 text-accent" />
-              {inv.verdict?.supporting_evidence.length} supporting
             </div>
           </div>
         </div>

@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![Tests](https://img.shields.io/badge/Tests-60%2B%20passing-2EA44F)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-48%20maintained%20passing-2EA44B)](#testing)
 [![License](https://img.shields.io/badge/License-MIT-F5C518)](#license)
 
 [**GitHub Repository**](https://github.com/mahadiurrehman-pixel/ai-research-evidence-system)
@@ -35,6 +35,21 @@ Unlike a conventional search-and-summarize tool, Reality Checker follows a **Pla
 - **High-throughput scheduling** with concurrent requests, provider rotation, cooldowns, and failover.
 - **Deterministic sufficiency checks** based on study design, sample size, peer-review status, and independent evidence groups.
 - **Persistent storage** backed by SQLite and ChromaDB for investigations, semantic caching, and evidence indexing.
+- **Reliability telemetry** for provider usage, 429s, fallbacks, incomplete structured responses, and per-stage latency.
+
+### Verified performance baseline
+
+On the 25-source AI-assisted learning scenario, the healthy production path has been measured at approximately **15.5 seconds**:
+
+| Stage | Healthy baseline |
+|---|---:|
+| Analyze | 7.69s |
+| Contradiction detection | 1.77s |
+| Verification | 0.00s |
+| Final judge | 4.24s |
+| Total | 15.50s |
+
+Analyze remains a single structured call with a `4096` token output budget. Parallel Analyze batching was tested and rejected because it increased shared provider quota pressure, reduced downstream contradiction completion, and caused Judge 429s. Further latency reduction requires higher provider quota or a separately verified fast structured-output model.
 
 ---
 
@@ -46,7 +61,7 @@ Unlike a conventional search-and-summarize tool, Reality Checker follows a **Pla
 └────────┬─────────┘
          │
 ┌────────▼─────────┐
-│ M4 Frontend      │  Streamlit UI · SQLite · ChromaDB
+│ M4 Persistence   │  Streamlit UI · SQLite · ChromaDB
 │ Cache & Storage   │  Persistent semantic cache and evidence index
 └────────┬─────────┘
          │
@@ -75,7 +90,8 @@ Unlike a conventional search-and-summarize tool, Reality Checker follows a **Pla
 | **M1** | Orchestrator | Classifies questions, plans balanced searches, and manages adaptive research loops. |
 | **M2** | Retrieval | Discovers and extracts evidence from academic databases and web sources. |
 | **M3** | Verification | Deduplicates, weighs, and compares evidence before generating a calibrated verdict. |
-| **M4** | Frontend & persistence | Renders results, manages cache and storage, and maintains investigation history. |
+| **M4** | Frontend & persistence | Provides the Streamlit interface, SQLite history, semantic cache, and evidence index. |
+| **FastAPI + Next.js** | API frontend | Exposes the REST polling API and web frontend in `api/` and `frontend/`. |
 
 ---
 
@@ -102,8 +118,8 @@ LLM calls are routed according to task complexity and expected reasoning require
 |---|---|---|
 | **Fast** | Groq | Query planning, classification, and decomposition |
 | **Balanced** | Groq / Gemini | Evidence extraction and grouping |
-| **Reasoning** | Gemini | Contradiction detection and context comparison |
-| **Strong** | Gemini → Groq → Qwen-72B | Final verdict synthesis |
+| **Reasoning** | Groq | Contradiction detection and context comparison, with bounded fallback |
+| **Strong** | Groq | Final verdict synthesis, with bounded fallback |
 
 ### 4. High-throughput scheduling with failover
 
@@ -111,6 +127,8 @@ LLM calls are routed according to task complexity and expected reasoning require
 - Per-provider cooldowns when a key receives an HTTP 429 response.
 - Fail-fast timeouts that move to the next provider.
 - Round-robin rotation across up to four Groq API keys.
+- Aggregate metrics for provider calls, 429s, fallbacks, failures, and task latency.
+- Explicit incomplete-analysis metrics; missing evidence is marked as fallback output rather than treated as valid neutral evidence.
 
 ### 5. Deterministic evidence sufficiency
 
@@ -143,6 +161,7 @@ Final verdicts include:
 |---|---|
 | Language | Python 3.10+; developed with Python 3.12 |
 | UI framework | Streamlit |
+| API / web frontend | FastAPI / Next.js 14 |
 | Data validation | Pydantic v2 |
 | LLM providers | Groq, Google Gemini, Hugging Face |
 | Strong-model options | Qwen 72B / 32B Instruct |
@@ -212,6 +231,11 @@ SCHEDULER_MAX_CONCURRENCY=6
 SCHEDULER_BATCH_SIZE=8
 SCHEDULER_INTER_BATCH_DELAY=0.3
 SCHEDULER_PROVIDER_COOLDOWN=30
+
+# ── Structured-output budgets ──
+MAX_OUTPUT_TOKENS_ANALYSIS=4096
+MAX_OUTPUT_TOKENS_CONTRADICTION=512
+MAX_OUTPUT_TOKENS_FINAL_VERDICT=1024
 ```
 
 > **Security:** Never commit `.env` or live API keys to source control. Use `.env.example` as a template for new environments.
@@ -231,6 +255,24 @@ Then open the local URL printed by Streamlit, normally:
 ```text
 http://localhost:8501
 ```
+
+### FastAPI + Next.js frontend
+
+Start the API from the project root:
+
+```bash
+uvicorn api.main:app --reload --port 8000
+```
+
+Start the Next.js frontend in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The web frontend is normally available at `http://localhost:3000`.
 
 ### Command-line demo
 
@@ -261,7 +303,13 @@ python -m pytest m1/tests/ -v
 python -m pytest m4/tests/test_m4.py -v
 ```
 
-The project currently documents **60+ tests** across the M1, M3, and M4 components.
+The maintained suites currently report **48 passing tests** across the M1, M3, and M4 components:
+
+```bash
+python -m pytest -q tests m1/tests m4/tests
+```
+
+Provider-dependent live timings vary with quota and network conditions. Provider fallbacks and incomplete structured responses are reported through reliability metrics and logs rather than being presented as healthy runs.
 
 ---
 

@@ -1,14 +1,7 @@
 "use client";
 
 import { Logo } from "@/components/icons/Logo";
-import { Badge } from "@/components/ui/Badge";
-import {
-  Settings,
-  Bell,
-  Search,
-  Menu,
-  X,
-} from "lucide-react";
+import { Menu, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
@@ -51,24 +44,7 @@ export function TopNav() {
           </nav>
         </div>
 
-        {/* Right */}
         <div className="flex items-center gap-3">
-          <Badge variant="accent" size="sm" className="hidden sm:inline-flex">
-            <span className="w-1.5 h-1.5 rounded-full bg-accent mr-1.5 animate-pulse-slow" />
-            System Online
-          </Badge>
-
-          <button aria-label="Search" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
-            <Search className="w-4 h-4" />
-          </button>
-
-          <button aria-label="Notifications" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
-            <Bell className="w-4 h-4" />
-          </button>
-
-          <button aria-label="Settings" className="hidden sm:block p-2 rounded-lg text-slate-400 hover:text-surface-100 hover:bg-ink-800/70 transition-colors">
-            <Settings className="w-4 h-4" />
-          </button>
           <button
             aria-label={menuOpen ? "Close navigation" : "Open navigation"}
             onClick={() => setMenuOpen(!menuOpen)}

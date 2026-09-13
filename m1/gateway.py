@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
 from typing import Any, Callable, Optional, Type, TypeVar
 
@@ -152,6 +153,16 @@ def _get_timeout_for_task(task_type: str) -> float:
     return getattr(CONFIG, "LLM_TIMEOUT", 25.0)
 
 
+def _get_max_output_tokens_for_task(task_type: str) -> Optional[int]:
+    if task_type in ("evidence_analysis", "evidence_extraction"):
+        return getattr(CONFIG, "MAX_OUTPUT_TOKENS_ANALYSIS", 2048)
+    if task_type in ("contradiction_detection", "contradiction_pairs"):
+        return getattr(CONFIG, "MAX_OUTPUT_TOKENS_CONTRADICTION", 512)
+    if task_type in ("final_verdict", "final_synthesis"):
+        return getattr(CONFIG, "MAX_OUTPUT_TOKENS_FINAL_VERDICT", 1024)
+    return None
+
+
 # ============================================================
 # Provider Interface
 # ============================================================
@@ -166,6 +177,7 @@ class _Provider:
         user: str,
         model: Type[T],
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> T:
         raise NotImplementedError
 
@@ -218,6 +230,7 @@ class _OpenAICompatibleProvider(_Provider):
         timeout: float,
         response_format: Optional[dict[str, Any]] = None,
         include_temperature: bool = True,
+        max_tokens: Optional[int] = None,
     ):
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -226,6 +239,8 @@ class _OpenAICompatibleProvider(_Provider):
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if include_temperature:
             kwargs["temperature"] = CONFIG.LLM_TEMPERATURE
 
@@ -256,6 +271,7 @@ class _OpenAICompatibleProvider(_Provider):
         user: str,
         model: Type[T],
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> T:
         t = timeout if timeout is not None else self._default_timeout
         provider_schema = self._schema_builder(model)
@@ -282,6 +298,7 @@ class _OpenAICompatibleProvider(_Provider):
                         "schema": provider_schema,
                     },
                 },
+                max_tokens=max_tokens,
             )
             content = self._extract_content(completion)
             if content:
@@ -302,6 +319,7 @@ class _OpenAICompatibleProvider(_Provider):
                 messages=messages,
                 timeout=t,
                 response_format={"type": "json_object"},
+                max_tokens=max_tokens,
             )
             content = self._extract_content(completion)
             if content:
@@ -321,6 +339,7 @@ class _OpenAICompatibleProvider(_Provider):
             messages=messages,
             timeout=t,
             response_format=None,
+            max_tokens=max_tokens,
         )
         content = self._extract_content(completion)
         if not content:
@@ -415,7 +434,11 @@ class _GeminiProvider(_Provider):
     def __init__(self, api_key: str, model_name: str, timeout: float):
         try:
             from google import genai
-            self._client = genai.Client(api_key=api_key)
+            from google.genai import types
+            self._client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=max(1, int(timeout * 1000))),
+            )
             self._use_new_sdk = True
         except ImportError:
             import google.generativeai as genai
@@ -433,6 +456,7 @@ class _GeminiProvider(_Provider):
         user: str,
         model: Type[T],
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> T:
         schema = build_gemini_schema(model)
         prompt = f"{system}\n\nUSER:\n{user}"
@@ -446,6 +470,7 @@ class _GeminiProvider(_Provider):
                     temperature=CONFIG.LLM_TEMPERATURE,
                     response_mime_type="application/json",
                     response_schema=schema,
+                    max_output_tokens=max_tokens,
                 ),
             )
         else:
@@ -458,6 +483,7 @@ class _GeminiProvider(_Provider):
                 generation_config={
                     "response_mime_type": "application/json",
                     "temperature": CONFIG.LLM_TEMPERATURE,
+                    "max_output_tokens": max_tokens,
                 },
             )
 
@@ -558,6 +584,7 @@ class _HuggingFaceProvider(_Provider):
         user: str,
         model: Type[T],
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> T:
         provider = _OpenAICompatibleProvider.__new__(_OpenAICompatibleProvider)
         provider.name = self.name
@@ -568,6 +595,7 @@ class _HuggingFaceProvider(_Provider):
 
         return provider.structured(
             system=system, user=user, model=model, timeout=timeout,
+            max_tokens=max_tokens,
         )
 
     def structured(
@@ -576,12 +604,13 @@ class _HuggingFaceProvider(_Provider):
         user: str,
         model: Type[T],
         timeout: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> T:
         try:
-            return self._do_structured(system, user, model, timeout=timeout)
+            return self._do_structured(system, user, model, timeout=timeout, max_tokens=max_tokens)
         except Exception as error:
             if _is_model_unavailable(error) and self._try_switch():
-                return self._do_structured(system, user, model, timeout=timeout)
+                return self._do_structured(system, user, model, timeout=timeout, max_tokens=max_tokens)
             raise
 
     def _do_text(
@@ -656,6 +685,16 @@ class LLMGateway:
         self._scheduler = scheduler or get_default_scheduler()
         self._task_router = task_router or get_default_task_router()
         self._last_call_metadata: dict[str, Any] = {}
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            "calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "rate_limit_count": 0,
+            "fallback_count": 0,
+            "provider_calls": {},
+            "task_latency_ms": {},
+        }
 
         self._build_provider_chain()
 
@@ -664,6 +703,43 @@ class LLMGateway:
 
     def get_last_call_metadata(self) -> dict:
         return dict(self._last_call_metadata)
+
+    def get_metrics(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            return {
+                **self._metrics,
+                "provider_calls": dict(self._metrics["provider_calls"]),
+                "task_latency_ms": {
+                    task: dict(values)
+                    for task, values in self._metrics["task_latency_ms"].items()
+                },
+            }
+
+    def record_metric(self, name: str, amount: int = 1) -> None:
+        with self._metrics_lock:
+            self._metrics[name] = self._metrics.get(name, 0) + amount
+
+    def _record_call_metric(
+        self,
+        task_type: str,
+        provider_name: str,
+        latency_ms: int,
+        succeeded: bool,
+        fallback: bool,
+    ) -> None:
+        with self._metrics_lock:
+            self._metrics["calls"] += 1
+            self._metrics["successful_calls" if succeeded else "failed_calls"] += 1
+            if fallback:
+                self._metrics["fallback_count"] += 1
+            provider_calls = self._metrics["provider_calls"]
+            provider_calls[provider_name] = provider_calls.get(provider_name, 0) + 1
+            task_metrics = self._metrics["task_latency_ms"].setdefault(
+                task_type, {"calls": 0, "total": 0, "max": 0}
+            )
+            task_metrics["calls"] += 1
+            task_metrics["total"] += latency_ms
+            task_metrics["max"] = max(task_metrics["max"], latency_ms)
 
     def _build_provider_chain(self) -> None:
         def add_provider(provider: _Provider) -> None:
@@ -743,6 +819,10 @@ class LLMGateway:
     def has_providers(self) -> bool:
         return bool(self._providers)
 
+    @property
+    def available_provider_names(self) -> list[str]:
+        return [provider.name for provider in self._providers]
+
     def structured_call(
         self,
         system: str,
@@ -752,15 +832,14 @@ class LLMGateway:
     ) -> T:
         task_type = kwargs.get("task_type", "default")
         return self._call_with_fallback(
-            fn=lambda provider, timeout: provider.structured(
-                system=system,
-                user=user,
-                model=response_model,
-                timeout=timeout,
+            fn=lambda provider, timeout: self._structured_provider_call(
+                provider, system, user, response_model, timeout, task_type,
             ),
             label=f"structured<{response_model.__name__}>",
             task_type=task_type,
             operation="structured",
+            provider_hint=kwargs.get("provider_hint"),
+            max_provider_attempts=kwargs.get("max_provider_attempts"),
         )
 
     def text_call(
@@ -779,7 +858,35 @@ class LLMGateway:
             label="text_call",
             task_type=task_type,
             operation="text",
+            provider_hint=kwargs.get("provider_hint"),
+            max_provider_attempts=kwargs.get("max_provider_attempts"),
         )
+
+    @staticmethod
+    def _structured_provider_call(
+        provider: _Provider,
+        system: str,
+        user: str,
+        response_model: Type[T],
+        timeout: float,
+        task_type: str,
+    ) -> T:
+        kwargs: dict[str, Any] = {
+            "system": system,
+            "user": user,
+            "model": response_model,
+            "timeout": timeout,
+        }
+        max_tokens = _get_max_output_tokens_for_task(task_type)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        try:
+            return provider.structured(**kwargs)
+        except TypeError as error:
+            if max_tokens is not None and "max_tokens" in str(error):
+                kwargs.pop("max_tokens", None)
+                return provider.structured(**kwargs)
+            raise
 
     def _call_with_fallback(
         self,
@@ -787,6 +894,8 @@ class LLMGateway:
         label: str,
         task_type: str = "default",
         operation: str = "structured",
+        provider_hint: Optional[str] = None,
+        max_provider_attempts: Optional[int] = None,
     ) -> Any:
         if not self._providers:
             raise LLMPermanentError("No LLM providers configured")
@@ -801,6 +910,9 @@ class LLMGateway:
             available_names,
             cooled_down_providers=cooled,
         )
+
+        if provider_hint in routed_names and not self._scheduler.is_in_cooldown(provider_hint):
+            routed_names = [provider_hint] + [name for name in routed_names if name != provider_hint]
 
         ordered_names: list[str] = []
         for name in routed_names:
@@ -817,6 +929,8 @@ class LLMGateway:
             for name in ordered_names
             if name in self._provider_map
         ]
+        if max_provider_attempts is not None:
+            ordered_providers = ordered_providers[:max(1, max_provider_attempts)]
 
         last_error: Optional[Exception] = None
         provider_attempt_number = 0
@@ -868,6 +982,9 @@ class LLMGateway:
                         "fallback_from": first_provider_tried if is_fallback else None,
                         "timestamp": time.time(),
                     }
+                    self._record_call_metric(
+                        task_type, provider.name, latency_ms, True, is_fallback
+                    )
 
                     self._task_router.record_call(
                         task_type,
@@ -896,9 +1013,13 @@ class LLMGateway:
                         "fallback_from": first_provider_tried if is_fallback else None,
                         "timestamp": time.time(),
                     }
+                    self._record_call_metric(
+                        task_type, provider.name, latency_ms, False, is_fallback
+                    )
 
                     # ★ Fast failover for rate limit: 10s soft cooldown (NOT 3600s!)
                     if is_rate_limit_error(raw_error):
+                        self.record_metric("rate_limit_count")
                         retry_after = _extract_retry_after(raw_error)
                         cooldown = min(15.0, retry_after or 10.0)
                         self._scheduler.set_cooldown(provider.name, cooldown)

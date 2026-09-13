@@ -61,8 +61,11 @@ class Config:
     # ── Task-specific timeouts ──
     TIMEOUT_QUERY_GENERATION: float = float(os.getenv("TIMEOUT_QUERY_GENERATION", "15.0"))
     TIMEOUT_EVIDENCE_ANALYSIS: float = float(os.getenv("TIMEOUT_EVIDENCE_ANALYSIS", "30.0"))
-    TIMEOUT_CONTRADICTION_PAIRS: float = float(os.getenv("TIMEOUT_CONTRADICTION_PAIRS", "30.0"))
+    MAX_OUTPUT_TOKENS_ANALYSIS: int = int(os.getenv("MAX_OUTPUT_TOKENS_ANALYSIS", "4096"))
+    TIMEOUT_CONTRADICTION_PAIRS: float = float(os.getenv("TIMEOUT_CONTRADICTION_PAIRS", "10.0"))
+    MAX_OUTPUT_TOKENS_CONTRADICTION: int = int(os.getenv("MAX_OUTPUT_TOKENS_CONTRADICTION", "512"))
     TIMEOUT_FINAL_VERDICT: float = float(os.getenv("TIMEOUT_FINAL_VERDICT", "45.0"))
+    MAX_OUTPUT_TOKENS_FINAL_VERDICT: int = int(os.getenv("MAX_OUTPUT_TOKENS_FINAL_VERDICT", "1024"))
 
     # ── Standard timeouts ──
     LLM_TIMEOUT: float = 30.0

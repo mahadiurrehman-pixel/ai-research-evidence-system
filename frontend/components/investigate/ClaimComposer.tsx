@@ -8,9 +8,6 @@ import {
   Zap,
   ArrowRight,
   Command,
-  BookOpen,
-  Scale,
-  Shield,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -19,22 +16,8 @@ interface ClaimComposerProps {
   loading?: boolean;
 }
 
-const modes = [
-  { id: "verify", label: "Verify Claim", icon: Shield },
-  { id: "compare", label: "Compare Evidence", icon: Scale },
-  { id: "review", label: "Literature Review", icon: BookOpen },
-];
-
-const suggestions = [
-  "Does AI-assisted learning improve student performance?",
-  "Is intermittent fasting effective for weight loss?",
-  "Does remote work reduce team productivity?",
-  "Is nuclear energy safer than fossil fuels?",
-];
-
 export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
   const [query, setQuery] = useState("");
-  const [selectedMode, setSelectedMode] = useState("verify");
 
   const handleSubmit = () => {
     if (query.trim() && !loading) {
@@ -44,28 +27,6 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
 
   return (
     <div className="w-full max-w-3xl mx-auto">
-      {/* Mode selector */}
-      <div className="flex items-center gap-1.5 mb-4 overflow-x-auto pb-1">
-        {modes.map((mode) => {
-          const Icon = mode.icon;
-          return (
-            <button
-              key={mode.id}
-              onClick={() => setSelectedMode(mode.id)}
-              className={cn(
-                "flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 whitespace-nowrap",
-                selectedMode === mode.id
-                  ? "bg-accent/10 text-accent border border-accent/20"
-                  : "text-slate-500 hover:text-surface-200 hover:bg-ink-800/40 border border-transparent"
-              )}
-            >
-              <Icon className="w-3.5 h-3.5" />
-              {mode.label}
-            </button>
-          );
-        })}
-      </div>
-
       {/* Input area */}
       <div className="relative group">
         <div
@@ -127,21 +88,9 @@ export function ClaimComposer({ onSubmit, loading }: ClaimComposerProps) {
         </div>
       </div>
 
-      {/* Suggestions */}
-      <div className="mt-5 flex flex-wrap gap-2">
-        <span className="text-2xs text-slate-500 font-medium mr-1 self-center">
-          Try:
-        </span>
-        {suggestions.map((s) => (
-          <button
-            key={s}
-            onClick={() => setQuery(s)}
-            className="text-xs text-slate-500 hover:text-accent px-3 py-1.5 rounded-full border border-ink-700/20 hover:border-accent/20 hover:bg-accent/5 transition-all duration-200 truncate max-w-[280px]"
-          >
-            {s}
-          </button>
-        ))}
-      </div>
+      <p className="mt-4 text-center text-xs text-slate-500">
+        Ask a specific, evidence-based question. Research may take up to a few minutes.
+      </p>
     </div>
   );
 }

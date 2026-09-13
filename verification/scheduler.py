@@ -313,6 +313,7 @@ class RequestScheduler:
         batch_size: Optional[int] = None,
         batch_delay: Optional[float] = None,
         provider_name: str = "default",
+        provider_names: Optional[Sequence[str]] = None,
         label: str = "batch",
     ) -> List[Any]:
         if not items:
@@ -338,7 +339,11 @@ class RequestScheduler:
                     self._execute_batch_item,
                     fn=fn,
                     item=item,
-                    provider_name=provider_name,
+                    provider_name=(
+                        provider_names[global_idx]
+                        if provider_names and global_idx < len(provider_names)
+                        else provider_name
+                    ),
                     request_label=item_label,
                 )
                 future_to_idx[future] = global_idx
@@ -373,9 +378,32 @@ class ScheduledLLMClient:
         self._provider = provider_name
         self._task_type = task_type
 
+    @property
+    def available_provider_names(self) -> list[str]:
+        names = getattr(self._inner, "available_provider_names", None)
+        if callable(names):
+            return list(names())
+        return list(names or [])
+
     def structured_call(self, system: str, user: str, response_model: Type[T], **kwargs) -> T:
         task = kwargs.pop("task_type", self._task_type)
-        return self._call_inner("structured_call", system, user, response_model, task_type=task)
+        return self._call_inner(
+            "structured_call",
+            system,
+            user,
+            response_model,
+            task_type=task,
+            **kwargs,
+        )
+
+    def get_metrics(self) -> dict:
+        getter = getattr(self._inner, "get_metrics", None)
+        return getter() if callable(getter) else {}
+
+    def record_metric(self, name: str, amount: int = 1) -> None:
+        recorder = getattr(self._inner, "record_metric", None)
+        if callable(recorder):
+            recorder(name, amount)
 
     def text_call(self, system, user, **kwargs) -> str:
         task = kwargs.pop("task_type", self._task_type)
@@ -387,6 +415,8 @@ class ScheduledLLMClient:
             return fn(*args, **kwargs)
         except TypeError:
             kwargs.pop("task_type", None)
+            kwargs.pop("provider_hint", None)
+            kwargs.pop("max_provider_attempts", None)
             return fn(*args, **kwargs)
 
 

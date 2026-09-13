@@ -6,7 +6,6 @@ import { ClaimComposer } from "@/components/investigate/ClaimComposer";
 import { VerdictDisplay } from "@/components/verdict/VerdictDisplay";
 import { EvidenceTimeline } from "@/components/verdict/EvidenceTimeline";
 import { startInvestigation, pollInvestigation, getInvestigation } from "@/lib/api";
-import { mockPipelineStages } from "@/lib/mock-data";
 import type { Investigation, PipelineStage } from "@/lib/types";
 import { Clock, FileSearch, Activity, AlertCircle, Terminal, HelpCircle } from "lucide-react";
 
@@ -20,6 +19,14 @@ const statusToStageMap: Record<string, number> = {
   INCONCLUSIVE: 6,
   FAILED: 6,
 };
+
+const pipelineStages: PipelineStage[] = [
+  { id: "routing", label: "Claim analysis", status: "pending" },
+  { id: "planning", label: "Research planning", status: "pending" },
+  { id: "searching", label: "Evidence retrieval", status: "pending" },
+  { id: "analyzing", label: "Analysis and verification", status: "pending" },
+  { id: "verdict", label: "Final result", status: "pending" },
+];
 
 function InvestigateContent() {
   const searchParams = useSearchParams();
@@ -46,7 +53,7 @@ function InvestigateContent() {
     setInvestigation(null);
     setLiveLogs(["Initializing research protocol...", "Connecting to orchestrator..."]);
 
-    const pendingStages = mockPipelineStages.map((s) => ({
+    const pendingStages = pipelineStages.map((s) => ({
       ...s,
       status: "pending" as const,
     }));
@@ -87,7 +94,7 @@ function InvestigateContent() {
         1000
       );
 
-      setStages(mockPipelineStages.map(s => ({ ...s, status: "complete" })));
+      setStages(pipelineStages.map(s => ({ ...s, status: "complete" })));
       setInvestigation(result);
       setLiveLogs(result.trace_summary || ["Processing complete."]);
 
@@ -215,7 +222,6 @@ function InvestigateContent() {
                   The system gathered {investigation?.evidence_count || 0} sources, but could not retrieve enough relevant empirical evidence to establish a definitive verdict for this query.
                 </p>
                 <div className="pt-2 text-2xs text-slate-500 font-mono">
-                  Tip: Mock M2 currently contains pre-loaded dataset papers on AI Learning. Connect live M2 search APIs for general web/fasting queries.
                 </div>
               </div>
             )}

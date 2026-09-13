@@ -64,6 +64,7 @@ class ContradictionDetector:
         self.embedder = embedder
         self._last_raw_evidence: Optional[list[RawEvidence]] = None
         self._scheduler = scheduler or get_default_scheduler()
+        self._comparison_cache: dict[tuple[str, str], ContradictionPair] = {}
 
     def detect(
         self,
@@ -95,21 +96,43 @@ class ContradictionDetector:
                 context_differences=[],
             )
 
-        # ★ HIGH-SPEED PARALLEL BATCH: Distribute pairs across keys
-        def _compare(pair_tuple: tuple[AnalyzedEvidence, AnalyzedEvidence], provider: str = "default") -> Optional[ContradictionPair]:
-            a, b = pair_tuple
-            return self._llm_compare(a, b)
+        unique_candidates = self._unique_pairs(candidate_pairs)
+        cached_pairs: list[ContradictionPair] = []
+        pending_candidates: list[tuple[AnalyzedEvidence, AnalyzedEvidence]] = []
+        for pair in unique_candidates:
+            cached = self._comparison_cache.get(self._pair_key(pair))
+            if cached is not None:
+                cached_pairs.append(cached)
+            else:
+                pending_candidates.append(pair)
+
+        pending_candidates = pending_candidates[:self.max_pairs]
+        provider_names = self._provider_names()
+        hinted_items = [
+            (pair, provider_names[index % len(provider_names)] if provider_names else None)
+            for index, pair in enumerate(pending_candidates)
+        ]
 
         raw_results = self._scheduler.process_batch(
-            items=candidate_pairs,
-            fn=lambda p: self._llm_compare(p[0], p[1]),
-            batch_size=5,
+            items=hinted_items,
+            fn=self._compare_hinted,
+            batch_size=len(hinted_items) or 1,
             batch_delay=0.0,
             provider_name="m3-contradiction",
+            provider_names=[
+                f"m3-contradiction:{provider or 'default'}"
+                for _, provider in hinted_items
+            ],
             label="contradiction_pairs",
-        )
+        ) if hinted_items else []
 
-        pairs: list[ContradictionPair] = [r for r in raw_results if r is not None]
+        fresh_pairs: list[ContradictionPair] = []
+        for item, result in zip(hinted_items, raw_results):
+            if result is not None:
+                self._comparison_cache[self._pair_key(item[0])] = result
+                fresh_pairs.append(result)
+
+        pairs: list[ContradictionPair] = cached_pairs + fresh_pairs
 
         consensus = self._weighted_consensus(relevant, raw_by_id)
 
@@ -127,6 +150,45 @@ class ContradictionDetector:
             overall_consensus=consensus,
             context_differences=context_diffs,
         )
+
+    @staticmethod
+    def _pair_key(
+        pair: tuple[AnalyzedEvidence, AnalyzedEvidence],
+    ) -> tuple[str, str]:
+        return tuple(sorted((pair[0].source_id, pair[1].source_id)))
+
+    def _unique_pairs(
+        self,
+        pairs: Sequence[tuple[AnalyzedEvidence, AnalyzedEvidence]],
+    ) -> list[tuple[AnalyzedEvidence, AnalyzedEvidence]]:
+        unique: list[tuple[AnalyzedEvidence, AnalyzedEvidence]] = []
+        seen: set[tuple[str, str]] = set()
+        for pair in pairs:
+            key = self._pair_key(pair)
+            if key not in seen:
+                seen.add(key)
+                unique.append(pair)
+        return unique
+
+    def _provider_names(self) -> list[str]:
+        names = getattr(self.llm, "available_provider_names", None)
+        if callable(names):
+            names = names()
+        names = list(names or [])
+        fast_names = [name for name in names if name.lower().startswith("groq")]
+        openrouter_names = [name for name in names if name.lower().startswith("openrouter")]
+        other_names = [
+            name for name in names
+            if name not in fast_names and name not in openrouter_names
+        ]
+        return fast_names + openrouter_names + other_names
+
+    def _compare_hinted(
+        self,
+        item: tuple[tuple[AnalyzedEvidence, AnalyzedEvidence], Optional[str]],
+    ) -> Optional[ContradictionPair]:
+        pair, provider_hint = item
+        return self._llm_compare(pair[0], pair[1], provider_hint=provider_hint)
 
     def _candidate_pairs(
         self, evidence: list[AnalyzedEvidence]
@@ -174,10 +236,13 @@ class ContradictionDetector:
                     continue
                 stage1.append((a, b))
 
-        return stage1[:self.max_pairs]
+        return stage1
 
     def _llm_compare(
-        self, a: AnalyzedEvidence, b: AnalyzedEvidence
+        self,
+        a: AnalyzedEvidence,
+        b: AnalyzedEvidence,
+        provider_hint: Optional[str] = None,
     ) -> ContradictionPair | None:
         shared = set(a.question_ids) & set(b.question_ids)
         shared_q = sorted(shared)[0] if shared else None
@@ -187,11 +252,17 @@ class ContradictionDetector:
             "Compare: CONTRADICTORY | CONTEXT_DIFFERENCE | NOT_CONTRADICTORY"
         )
         try:
+            kwargs: dict[str, Any] = {"task_type": "contradiction_detection"}
+            if provider_hint:
+                kwargs.update({
+                    "provider_hint": provider_hint,
+                    "max_provider_attempts": 2,
+                })
             pair = self.llm.structured_call(
                 system=CONTRADICTION_SYSTEM,
                 user=user,
                 response_model=ContradictionPair,
-                task_type="contradiction_detection",
+                **kwargs,
             )
         except Exception as e:
             logger.warning("Contradiction comparison failed (%s).", e)
